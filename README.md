@@ -1,6 +1,8 @@
 # ClaudeAdapter
 
-一个把 Claude Code 的 Anthropic 请求转成 OpenAI 兼容请求的 Rust 代理。你在 `config.yaml` 里配置供应商、默认模型和模型映射，Claude Code 指向本地服务后，请求就会按 `api_mode` 转发到对应供应商的 `/chat/completions` 或 `/responses`。
+一个让你在 Claude Code 上使用支持 OpenAI 格式供应商的 Rust 代理。  
+* 在 `config.yaml` 里配置供应商、默认模型和模型映射
+* 将 Claude Code 供应商更换为本地服务
 
 ## 配置
 
@@ -26,11 +28,11 @@ providers:
 
 说明：
 
-- `activate_provider`：当前启用的供应商
-- `model_map`：命中时使用映射模型
-- `model_default`：没命中映射时使用的默认模型
-- `api_mode`：`chat_completions` 或 `responses`
-- `api_key: env:XXX`：从 `.env` 或环境变量读取密钥
+* `activate_provider`：当前启用的供应商
+* `model_map`：命中时使用映射模型
+* `model_default`：没命中映射时使用的默认模型
+* `api_mode`：`chat_completions` 或 `responses`
+* `api_key: env:XXX`：从 `.env` 或环境变量读取密钥
 
 `.env` 示例：
 
@@ -40,7 +42,7 @@ BIGMODEL_API_KEY=your_api_key
 
 ## 使用
 
-默认读取当前目录的 `config.yaml`，如果有 `.env` 会自动加载：
+默认读取当前目录的 `config.yaml` ，如果有 `.env` 会自动加载：
 
 ```powershell
 cargo run
@@ -64,21 +66,21 @@ $env:ANTHROPIC_AUTH_TOKEN="claude_adapter"
 claude
 ```
 
-服务入口是 `POST /v1/messages`。
+服务入口是 `POST /v1/messages` 。
 
 ## 快速设置环境
 
 如果你不想手动设置环境变量，可以直接用 `scripts` 里的脚本：
 
-- Windows：双击 `scripts/win-open-claude-env.cmd`
-- Windows PowerShell：运行 `scripts/win-open-claude-env.ps1`
-- macOS：运行 `scripts/macos-open-claude-env.command`
-- Linux：运行 `scripts/linux-open-claude-env.sh`
+* Windows：双击 `scripts/win-open-claude-env.cmd`
+* Windows PowerShell：运行 `scripts/win-open-claude-env.ps1`
+* macOS：运行 `scripts/macos-open-claude-env.command`
+* Linux：运行 `scripts/linux-open-claude-env.sh`
 
 这些脚本会自动设置：
 
-- `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
-- `ANTHROPIC_AUTH_TOKEN=claude_adapter`
+* `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
+* `ANTHROPIC_AUTH_TOKEN=claude_adapter`
 
 ## 发布
 
