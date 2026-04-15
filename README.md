@@ -65,3 +65,17 @@ claude
 ```
 
 服务入口是 `POST /v1/messages`。
+
+## 快速设置环境
+
+如果你不想手动设置环境变量，可以直接用 `scripts` 里的脚本：
+
+- Windows：双击 `scripts/win-open-claude-env.cmd`
+- Windows PowerShell：运行 `scripts/win-open-claude-env.ps1`
+- macOS：运行 `scripts/macos-open-claude-env.command`
+- Linux：运行 `scripts/linux-open-claude-env.sh`
+
+这些脚本会自动设置：
+
+- `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
+- `ANTHROPIC_AUTH_TOKEN=claude_adapter`
