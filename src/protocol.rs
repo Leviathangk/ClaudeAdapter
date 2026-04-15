@@ -3,7 +3,7 @@ use axum::{
     http::{Response, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     config::{ApiMode, ProviderConfig},
@@ -94,6 +94,51 @@ pub(crate) enum AnthropicContentBlock {
         #[serde(default)]
         is_error: Option<bool>,
     },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "image")]
+    Image {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "document")]
+    Document {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "mcp_tool_use")]
+    McpToolUse {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "mcp_tool_result")]
+    McpToolResult {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "code_execution_tool_result")]
+    CodeExecutionToolResult {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "container_upload")]
+    ContainerUpload {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
     #[serde(other)]
     Other,
 }
@@ -121,6 +166,51 @@ pub(crate) enum AnthropicContentResponseBlock {
         id: String,
         name: String,
         input: Value,
+    },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "image")]
+    Image {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "document")]
+    Document {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "server_tool_use")]
+    ServerToolUse {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "mcp_tool_use")]
+    McpToolUse {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "mcp_tool_result")]
+    McpToolResult {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "code_execution_tool_result")]
+    CodeExecutionToolResult {
+        #[serde(flatten)]
+        data: Map<String, Value>,
+    },
+    #[serde(rename = "container_upload")]
+    ContainerUpload {
+        #[serde(flatten)]
+        data: Map<String, Value>,
     },
 }
 
@@ -174,6 +264,15 @@ pub(crate) fn anthropic_content_to_text(content: &AnthropicContent) -> Option<St
             AnthropicContentBlock::Text { text } => Some(text.clone()),
             AnthropicContentBlock::ToolUse { .. } => None,
             AnthropicContentBlock::ToolResult { .. } => None,
+            AnthropicContentBlock::Thinking { .. } => None,
+            AnthropicContentBlock::RedactedThinking { .. } => None,
+            AnthropicContentBlock::Image { .. } => None,
+            AnthropicContentBlock::Document { .. } => None,
+            AnthropicContentBlock::ServerToolUse { .. } => None,
+            AnthropicContentBlock::McpToolUse { .. } => None,
+            AnthropicContentBlock::McpToolResult { .. } => None,
+            AnthropicContentBlock::CodeExecutionToolResult { .. } => None,
+            AnthropicContentBlock::ContainerUpload { .. } => None,
             AnthropicContentBlock::Other => None,
         }),
     }

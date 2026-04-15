@@ -224,6 +224,51 @@ pub(crate) fn anthropic_single_response_sse(
                     "input": {}
                 }
             }),
+            AnthropicContentResponseBlock::Thinking { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("thinking", data)
+            }),
+            AnthropicContentResponseBlock::RedactedThinking { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("redacted_thinking", data)
+            }),
+            AnthropicContentResponseBlock::Image { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("image", data)
+            }),
+            AnthropicContentResponseBlock::Document { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("document", data)
+            }),
+            AnthropicContentResponseBlock::ServerToolUse { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("server_tool_use", data)
+            }),
+            AnthropicContentResponseBlock::McpToolUse { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("mcp_tool_use", data)
+            }),
+            AnthropicContentResponseBlock::McpToolResult { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("mcp_tool_result", data)
+            }),
+            AnthropicContentResponseBlock::CodeExecutionToolResult { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("code_execution_tool_result", data)
+            }),
+            AnthropicContentResponseBlock::ContainerUpload { data } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": block_with_type("container_upload", data)
+            }),
         };
         chunks.push(
             sse_event_bytes("content_block_start", block_start).map_err(|e| {
@@ -273,6 +318,15 @@ pub(crate) fn anthropic_single_response_sse(
                     })?,
                 );
             }
+            AnthropicContentResponseBlock::ServerToolUse { .. }
+            | AnthropicContentResponseBlock::Thinking { .. }
+            | AnthropicContentResponseBlock::RedactedThinking { .. }
+            | AnthropicContentResponseBlock::Image { .. }
+            | AnthropicContentResponseBlock::Document { .. }
+            | AnthropicContentResponseBlock::McpToolUse { .. }
+            | AnthropicContentResponseBlock::McpToolResult { .. }
+            | AnthropicContentResponseBlock::CodeExecutionToolResult { .. }
+            | AnthropicContentResponseBlock::ContainerUpload { .. } => {}
         }
 
         chunks.push(
@@ -318,6 +372,12 @@ fn sse_event_bytes(event: &str, data: Value) -> Result<Bytes, std::io::Error> {
     let payload = serde_json::to_string(&data)
         .map_err(|e| std::io::Error::other(format!("failed to encode sse event: {e}")))?;
     Ok(Bytes::from(format!("event: {event}\ndata: {payload}\n\n")))
+}
+
+fn block_with_type(block_type: &str, data: &serde_json::Map<String, Value>) -> Value {
+    let mut object = data.clone();
+    object.insert("type".to_string(), Value::String(block_type.to_string()));
+    Value::Object(object)
 }
 
 pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<String, ProxyError> {

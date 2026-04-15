@@ -10,13 +10,18 @@ use crate::{
         AnthropicContentBlock, AnthropicContentResponseBlock, AnthropicMessage,
         AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicUsage,
     },
+    rules::normalize_incoming_messages,
 };
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) enum NormalizedRole {
-    System,
+    SystemPrompt,
     User,
     Assistant,
+    Progress,
+    GroupedToolUse,
+    SystemEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +54,7 @@ pub(crate) enum NormalizedBlock {
 pub(crate) struct NormalizedMessage {
     pub(crate) role: NormalizedRole,
     pub(crate) blocks: Vec<NormalizedBlock>,
+    pub(crate) subtype: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,8 +78,9 @@ pub(crate) fn normalized_messages_from_anthropic(
     let mut messages = Vec::new();
     if let Some(system) = payload.system_text() {
         messages.push(NormalizedMessage {
-            role: NormalizedRole::System,
+            role: NormalizedRole::SystemPrompt,
             blocks: vec![NormalizedBlock::Text(system)],
+            subtype: None,
         });
     }
 
@@ -81,7 +88,7 @@ pub(crate) fn normalized_messages_from_anthropic(
         messages.push(normalized_message_from_anthropic(message));
     }
 
-    messages
+    normalize_incoming_messages(messages)
 }
 
 fn normalized_message_from_anthropic(message: &AnthropicMessage) -> NormalizedMessage {
@@ -97,7 +104,11 @@ fn normalized_message_from_anthropic(message: &AnthropicMessage) -> NormalizedMe
         }
     };
 
-    NormalizedMessage { role, blocks }
+    NormalizedMessage {
+        role,
+        blocks,
+        subtype: None,
+    }
 }
 
 fn normalized_block_from_anthropic(block: &AnthropicContentBlock) -> NormalizedBlock {
@@ -117,6 +128,33 @@ fn normalized_block_from_anthropic(block: &AnthropicContentBlock) -> NormalizedB
             content: content.clone(),
             is_error: is_error.unwrap_or(false),
         },
+        AnthropicContentBlock::Thinking { data } => {
+            NormalizedBlock::Thinking(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::RedactedThinking { data } => {
+            NormalizedBlock::RedactedThinking(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::Image { data } => {
+            NormalizedBlock::Image(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::Document { data } => {
+            NormalizedBlock::Document(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::ServerToolUse { data } => {
+            NormalizedBlock::ServerToolUse(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::McpToolUse { data } => {
+            NormalizedBlock::McpToolUse(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::McpToolResult { data } => {
+            NormalizedBlock::McpToolResult(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::CodeExecutionToolResult { data } => {
+            NormalizedBlock::CodeExecutionToolResult(Value::Object(data.clone()))
+        }
+        AnthropicContentBlock::ContainerUpload { data } => {
+            NormalizedBlock::ContainerUpload(Value::Object(data.clone()))
+        }
         AnthropicContentBlock::Other => {
             NormalizedBlock::Unknown(Value::String("unsupported_anthropic_block".to_string()))
         }
@@ -130,42 +168,56 @@ pub(crate) fn normalized_messages_to_chat_completions(
 
     for message in messages {
         match message.role {
-            NormalizedRole::System => {
-                let text = collect_text_blocks(&message.blocks);
+            NormalizedRole::SystemPrompt => {
+                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
                 if !text.is_empty() {
                     result.push(json!({ "role": "system", "content": text }));
                 }
             }
             NormalizedRole::User => {
-                let text = collect_text_blocks(&message.blocks);
-                if !text.is_empty() {
-                    result.push(json!({ "role": "user", "content": text }));
+                let mut pending_text = Vec::new();
+                for block in &message.blocks {
+                    match block {
+                        NormalizedBlock::Text(text) => pending_text.push(text.clone()),
+                        NormalizedBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } => {
+                            if !pending_text.is_empty() {
+                                result.push(json!({
+                                    "role": "user",
+                                    "content": pending_text.join("\n"),
+                                }));
+                                pending_text.clear();
+                            }
+
+                            let mut tool_message = json!({
+                                "role": "tool",
+                                "tool_call_id": tool_use_id,
+                                "content": anthropic_tool_result_text(content),
+                            });
+                            if *is_error {
+                                tool_message["content"] = json!(format!(
+                                    "ERROR: {}",
+                                    tool_message["content"].as_str().unwrap_or_default()
+                                ));
+                            }
+                            result.push(tool_message);
+                        }
+                        _ => {}
+                    }
                 }
 
-                for block in &message.blocks {
-                    if let NormalizedBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } = block
-                    {
-                        let mut tool_message = json!({
-                            "role": "tool",
-                            "tool_call_id": tool_use_id,
-                            "content": anthropic_tool_result_text(content),
-                        });
-                        if *is_error {
-                            tool_message["content"] = json!(format!(
-                                "ERROR: {}",
-                                tool_message["content"].as_str().unwrap_or_default()
-                            ));
-                        }
-                        result.push(tool_message);
-                    }
+                if !pending_text.is_empty() {
+                    result.push(json!({
+                        "role": "user",
+                        "content": strip_system_reminders(&pending_text.join("\n")),
+                    }));
                 }
             }
             NormalizedRole::Assistant => {
-                let text = collect_text_blocks(&message.blocks);
+                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
                 let tool_calls = message
                     .blocks
                     .iter()
@@ -193,6 +245,9 @@ pub(crate) fn normalized_messages_to_chat_completions(
                     result.push(assistant);
                 }
             }
+            NormalizedRole::Progress
+            | NormalizedRole::GroupedToolUse
+            | NormalizedRole::SystemEvent => {}
         }
     }
 
@@ -204,14 +259,14 @@ pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessa
 
     for message in messages {
         match message.role {
-            NormalizedRole::System => {
-                let text = collect_text_blocks(&message.blocks);
+            NormalizedRole::SystemPrompt => {
+                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
                 if !text.is_empty() {
                     lines.push(format!("System: {text}"));
                 }
             }
             NormalizedRole::User => {
-                let text = collect_text_blocks(&message.blocks);
+                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
                 if !text.is_empty() {
                     lines.push(format!("User: {text}"));
                 }
@@ -235,7 +290,7 @@ pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessa
                 }
             }
             NormalizedRole::Assistant => {
-                let text = collect_text_blocks(&message.blocks);
+                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
                 if !text.is_empty() {
                     lines.push(format!("Assistant: {text}"));
                 }
@@ -245,6 +300,9 @@ pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessa
                     }
                 }
             }
+            NormalizedRole::Progress
+            | NormalizedRole::GroupedToolUse
+            | NormalizedRole::SystemEvent => {}
         }
     }
 
@@ -256,7 +314,7 @@ fn collect_text_blocks(blocks: &[NormalizedBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             NormalizedBlock::Text(text) => Some(text.clone()),
-            _ => None,
+            _ => special_block_to_context_text(block),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -395,6 +453,10 @@ fn normalized_response_from_responses(
                         },
                     });
                 }
+                "thinking" => blocks.push(NormalizedBlock::Thinking(item.clone())),
+                "redacted_thinking" => blocks.push(NormalizedBlock::RedactedThinking(item.clone())),
+                "image" => blocks.push(NormalizedBlock::Image(item.clone())),
+                "document" => blocks.push(NormalizedBlock::Document(item.clone())),
                 "server_tool_use" => blocks.push(NormalizedBlock::ServerToolUse(item.clone())),
                 "mcp_tool_use" => blocks.push(NormalizedBlock::McpToolUse(item.clone())),
                 "mcp_tool_result" => blocks.push(NormalizedBlock::McpToolResult(item.clone())),
@@ -440,9 +502,38 @@ pub(crate) fn anthropic_response_from_normalized(
         .blocks
         .into_iter()
         .filter_map(|block| match block {
-            NormalizedBlock::Text(text) => Some(AnthropicContentResponseBlock::Text { text }),
+            NormalizedBlock::Text(text) => Some(AnthropicContentResponseBlock::Text {
+                text: strip_system_reminders(&text),
+            }),
             NormalizedBlock::ToolUse { id, name, input } => {
                 Some(AnthropicContentResponseBlock::ToolUse { id, name, input })
+            }
+            NormalizedBlock::Thinking(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::Thinking { data })
+            }
+            NormalizedBlock::RedactedThinking(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::RedactedThinking { data })
+            }
+            NormalizedBlock::Image(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::Image { data })
+            }
+            NormalizedBlock::Document(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::Document { data })
+            }
+            NormalizedBlock::ServerToolUse(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::ServerToolUse { data })
+            }
+            NormalizedBlock::McpToolUse(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::McpToolUse { data })
+            }
+            NormalizedBlock::McpToolResult(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::McpToolResult { data })
+            }
+            NormalizedBlock::CodeExecutionToolResult(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::CodeExecutionToolResult { data })
+            }
+            NormalizedBlock::ContainerUpload(Value::Object(data)) => {
+                Some(AnthropicContentResponseBlock::ContainerUpload { data })
             }
             _ => None,
         })
@@ -473,7 +564,24 @@ pub(crate) fn anthropic_response_from_normalized(
 }
 
 fn anthropic_tool_result_text(content: &Value) -> String {
-    value_as_text(content).unwrap_or_else(|| content.to_string())
+    strip_system_reminders(&value_as_text(content).unwrap_or_else(|| content.to_string()))
+}
+
+fn special_block_to_context_text(block: &NormalizedBlock) -> Option<String> {
+    match block {
+        NormalizedBlock::Thinking(value) => Some(format!("[thinking] {value}")),
+        NormalizedBlock::RedactedThinking(value) => Some(format!("[redacted_thinking] {value}")),
+        NormalizedBlock::Image(value) => Some(format!("[image] {value}")),
+        NormalizedBlock::Document(value) => Some(format!("[document] {value}")),
+        NormalizedBlock::ServerToolUse(value) => Some(format!("[server_tool_use] {value}")),
+        NormalizedBlock::McpToolUse(value) => Some(format!("[mcp_tool_use] {value}")),
+        NormalizedBlock::McpToolResult(value) => Some(format!("[mcp_tool_result] {value}")),
+        NormalizedBlock::CodeExecutionToolResult(value) => {
+            Some(format!("[code_execution_tool_result] {value}"))
+        }
+        NormalizedBlock::ContainerUpload(value) => Some(format!("[container_upload] {value}")),
+        _ => None,
+    }
 }
 
 fn simple_id() -> String {
@@ -483,6 +591,24 @@ fn simple_id() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or_default();
     format!("{nanos:x}")
+}
+
+fn strip_system_reminders(raw: &str) -> String {
+    const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+    const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+    let mut text = raw.to_string();
+    let mut open = text.find(SYSTEM_REMINDER_OPEN);
+    while let Some(start) = open {
+        let Some(rel_end) = text[start..].find(SYSTEM_REMINDER_CLOSE) else {
+            break;
+        };
+        let end = start + rel_end + SYSTEM_REMINDER_CLOSE.len();
+        text.replace_range(start..end, "");
+        open = text.find(SYSTEM_REMINDER_OPEN);
+    }
+
+    text.trim().to_string()
 }
 
 pub(crate) fn normalized_stream_events_from_openai(

@@ -3,6 +3,7 @@ mod error;
 mod logging;
 mod normalized;
 mod protocol;
+mod rules;
 mod server;
 mod streaming;
 
