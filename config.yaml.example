@@ -1,0 +1,26 @@
+bind: 127.0.0.1:8787
+
+incoming_api_key: claude_adapter
+
+activate_provider: bigmodel
+
+providers:
+  bigmodel:
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    api_mode: responses
+    api_key: env:BIGMODEL_API_KEY
+    headers: {}
+    model_default: GLM-4.7-Flash
+    model_map:
+      claude-sonnet-4.6: GLM-4.6V-Flash
+      claude-opus-4-6: GLM-4.6V-Flash
+
+  another-provider:
+    base_url: https://your-provider.example.com/v1
+    api_mode: chat_completions
+    api_key: env:ANOTHER_PROVIDER_API_KEY
+    headers: {}
+    model_default: gpt-4.1-mini
+    model_map:
+      claude-sonnet-4.6: gpt-4.1
+      claude-opus-4-6: o3
