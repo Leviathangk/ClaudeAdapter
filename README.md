@@ -79,3 +79,14 @@ claude
 
 - `ANTHROPIC_BASE_URL=http://127.0.0.1:8787`
 - `ANTHROPIC_AUTH_TOKEN=claude_adapter`
+
+## 发布
+
+推送版本 tag 后会自动编译 Windows、macOS、Linux，并把产物上传到 GitHub Release。
+
+例如：
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```

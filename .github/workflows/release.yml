@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux
+            binary: claude-adapter
+            asset: claude-adapter-linux-x86_64.tar.gz
+            archive: tar.gz
+          - os: windows-latest
+            label: windows
+            binary: claude-adapter.exe
+            asset: claude-adapter-windows-x86_64.zip
+            archive: zip
+          - os: macos-latest
+            label: macos
+            binary: claude-adapter
+            asset: claude-adapter-macos.tar.gz
+            archive: tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/claude-adapter
+          cp "target/release/${{ matrix.binary }}" dist/claude-adapter/
+          cp config.yaml.example dist/claude-adapter/
+          cp README.md dist/claude-adapter/
+          tar -czf "dist/${{ matrix.asset }}" -C dist claude-adapter
+
+      - name: Prepare package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/claude-adapter -Force | Out-Null
+          Copy-Item "target/release/${{ matrix.binary }}" "dist/claude-adapter/${{ matrix.binary }}"
+          Copy-Item "config.yaml.example" "dist/claude-adapter/config.yaml.example"
+          Copy-Item "README.md" "dist/claude-adapter/README.md"
+          Compress-Archive -Path dist/claude-adapter/* -DestinationPath "dist/${{ matrix.asset }}" -Force
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}
+          generate_release_notes: true
