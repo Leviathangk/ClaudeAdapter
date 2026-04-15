@@ -7,10 +7,8 @@ use crate::{
     config::ApiMode,
     error::ProxyError,
     logging::{append_error_log, preview_text},
-    protocol::{
-        estimate_token_count, map_stop_reason, AnthropicContentResponseBlock,
-        AnthropicMessagesResponse,
-    },
+    normalized::{normalized_stream_events_from_openai, NormalizedStreamEvent},
+    protocol::{estimate_token_count, AnthropicContentResponseBlock, AnthropicMessagesResponse},
 };
 
 pub(crate) fn anthropic_sse_stream(
@@ -55,100 +53,90 @@ pub(crate) fn anthropic_sse_stream(
                 match event.as_str() {
                     "[DONE]" => {}
                     _ => {
-                        if let Some(tool_delta) = extract_stream_tool_delta(api_mode, &event) {
-                            let should_start = match &active_block {
-                                Some(StreamBlockState::ToolUse { id, name, .. }) => {
-                                    let incoming_id = if tool_delta.id.is_empty() { id } else { &tool_delta.id };
-                                    let incoming_name = if tool_delta.name.is_empty() { name } else { &tool_delta.name };
-                                    id != incoming_id || name != incoming_name
-                                }
-                                Some(StreamBlockState::Text) => true,
-                                None => true,
-                            };
-
-                            if should_start {
-                                if let Some(previous) = active_block.take() {
-                                    yield content_block_stop_event(previous.index())?;
-                                }
-                                yield sse_event_bytes(
-                                    "content_block_start",
-                                    json!({
-                                        "type": "content_block_start",
-                                        "index": 0,
-                                        "content_block": {
-                                            "type": "tool_use",
-                                            "id": tool_delta.id,
-                                            "name": tool_delta.name,
-                                            "input": {}
+                        for normalized_event in normalized_stream_events_from_openai(api_mode, &event) {
+                            match normalized_event {
+                                NormalizedStreamEvent::ToolUseStart { id, name } => {
+                                    let should_start = match &active_block {
+                                        Some(StreamBlockState::ToolUse { id: current_id, name: current_name, .. }) => {
+                                            current_id != &id || current_name != &name
                                         }
-                                    }),
-                                )?;
-                                active_block = Some(StreamBlockState::ToolUse {
-                                    index: 0,
-                                    id: tool_delta.id.clone(),
-                                    name: tool_delta.name.clone(),
-                                });
-                            } else if let Some(StreamBlockState::ToolUse { id, name, .. }) = &mut active_block {
-                                if !tool_delta.id.is_empty() {
-                                    *id = tool_delta.id.clone();
-                                }
-                                if !tool_delta.name.is_empty() {
-                                    *name = tool_delta.name.clone();
-                                }
-                            }
+                                        Some(StreamBlockState::Text) => true,
+                                        None => true,
+                                    };
 
-                            if !tool_delta.arguments.is_empty() {
-                                yield sse_event_bytes(
-                                    "content_block_delta",
-                                    json!({
-                                        "type": "content_block_delta",
-                                        "index": 0,
-                                        "delta": {
-                                            "type": "input_json_delta",
-                                            "partial_json": tool_delta.arguments
+                                    if should_start {
+                                        if let Some(previous) = active_block.take() {
+                                            yield content_block_stop_event(previous.index())?;
                                         }
-                                    }),
-                                )?;
-                            }
-                        }
-
-                        if let Some(text) = extract_stream_text(api_mode, &event) {
-                            if !text.is_empty() {
-                                let start_text_block = !matches!(active_block, Some(StreamBlockState::Text));
-                                if start_text_block {
-                                    if let Some(previous) = active_block.take() {
-                                        yield content_block_stop_event(previous.index())?;
+                                        yield sse_event_bytes(
+                                            "content_block_start",
+                                            json!({
+                                                "type": "content_block_start",
+                                                "index": 0,
+                                                "content_block": {
+                                                    "type": "tool_use",
+                                                    "id": id,
+                                                    "name": name,
+                                                    "input": {}
+                                                }
+                                            }),
+                                        )?;
+                                        active_block = Some(StreamBlockState::ToolUse { index: 0, id, name });
                                     }
-                                    yield sse_event_bytes(
-                                        "content_block_start",
-                                        json!({
-                                            "type": "content_block_start",
-                                            "index": 0,
-                                            "content_block": {
-                                                "type": "text",
-                                                "text": ""
-                                            }
-                                        }),
-                                    )?;
-                                    active_block = Some(StreamBlockState::Text);
                                 }
-                                output_text.push_str(&text);
-                                yield sse_event_bytes(
-                                    "content_block_delta",
-                                    json!({
-                                        "type": "content_block_delta",
-                                        "index": 0,
-                                        "delta": {
-                                            "type": "text_delta",
-                                            "text": text
+                                NormalizedStreamEvent::ToolInputDelta { partial_json } => {
+                                    if !partial_json.is_empty() {
+                                        yield sse_event_bytes(
+                                            "content_block_delta",
+                                            json!({
+                                                "type": "content_block_delta",
+                                                "index": 0,
+                                                "delta": {
+                                                    "type": "input_json_delta",
+                                                    "partial_json": partial_json
+                                                }
+                                            }),
+                                        )?;
+                                    }
+                                }
+                                NormalizedStreamEvent::TextDelta(text) => {
+                                    if !text.is_empty() {
+                                        let start_text_block = !matches!(active_block, Some(StreamBlockState::Text));
+                                        if start_text_block {
+                                            if let Some(previous) = active_block.take() {
+                                                yield content_block_stop_event(previous.index())?;
+                                            }
+                                            yield sse_event_bytes(
+                                                "content_block_start",
+                                                json!({
+                                                    "type": "content_block_start",
+                                                    "index": 0,
+                                                    "content_block": {
+                                                        "type": "text",
+                                                        "text": ""
+                                                    }
+                                                }),
+                                            )?;
+                                            active_block = Some(StreamBlockState::Text);
                                         }
-                                    }),
-                                )?;
+                                        output_text.push_str(&text);
+                                        yield sse_event_bytes(
+                                            "content_block_delta",
+                                            json!({
+                                                "type": "content_block_delta",
+                                                "index": 0,
+                                                "delta": {
+                                                    "type": "text_delta",
+                                                    "text": text
+                                                }
+                                            }),
+                                        )?;
+                                    }
+                                }
+                                NormalizedStreamEvent::StopReason(reason) => {
+                                    stop_reason = reason;
+                                }
                             }
-                        }
-
-                        if let Some(reason) = extract_stream_stop_reason(api_mode, &event) {
-                            stop_reason = reason;
                         }
                     }
                 }
@@ -332,145 +320,6 @@ fn sse_event_bytes(event: &str, data: Value) -> Result<Bytes, std::io::Error> {
     Ok(Bytes::from(format!("event: {event}\ndata: {payload}\n\n")))
 }
 
-fn extract_stream_text(api_mode: ApiMode, raw: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    match api_mode {
-        ApiMode::ChatCompletions => value
-            .get("choices")?
-            .as_array()?
-            .first()?
-            .get("delta")?
-            .get("content")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        ApiMode::Responses => extract_responses_stream_text(&value),
-    }
-}
-
-fn extract_stream_tool_delta(api_mode: ApiMode, raw: &str) -> Option<StreamToolDelta> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    match api_mode {
-        ApiMode::ChatCompletions => {
-            let call = value
-                .get("choices")?
-                .as_array()?
-                .first()?
-                .get("delta")?
-                .get("tool_calls")?
-                .as_array()?
-                .first()?;
-            let function = call.get("function")?;
-            Some(StreamToolDelta {
-                id: call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                name: function
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                arguments: function
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            })
-        }
-        ApiMode::Responses => {
-            let event_type = value.get("type")?.as_str()?;
-            match event_type {
-                "response.output_item.added" => {
-                    let item = value.get("item")?;
-                    if item.get("type")?.as_str()? != "function_call" {
-                        return None;
-                    }
-                    Some(StreamToolDelta {
-                        id: item
-                            .get("id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: String::new(),
-                    })
-                }
-                "response.function_call_arguments.delta" => Some(StreamToolDelta {
-                    id: value
-                        .get("item_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: String::new(),
-                    arguments: value
-                        .get("delta")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                }),
-                _ => None,
-            }
-        }
-    }
-}
-
-fn extract_responses_stream_text(value: &Value) -> Option<String> {
-    let event_type = value.get("type").and_then(Value::as_str);
-    match event_type {
-        Some("response.output_text.delta") => value
-            .get("delta")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        Some("response.output_item.added") => None,
-        _ => value
-            .get("delta")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| {
-                value
-                    .get("output_text")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .or_else(|| {
-                value
-                    .get("output")
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.first())
-                    .and_then(|item| item.get("content"))
-                    .and_then(Value::as_array)
-                    .and_then(|items| items.first())
-                    .and_then(|part| part.get("text"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            }),
-    }
-}
-
-fn extract_stream_stop_reason(api_mode: ApiMode, raw: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(raw).ok()?;
-    let reason = match api_mode {
-        ApiMode::ChatCompletions => value
-            .get("choices")?
-            .as_array()?
-            .first()?
-            .get("finish_reason")
-            .and_then(Value::as_str),
-        ApiMode::Responses => value
-            .get("response")
-            .and_then(|response| response.get("stop_reason"))
-            .and_then(Value::as_str)
-            .or_else(|| value.get("stop_reason").and_then(Value::as_str))
-            .or_else(|| value.get("finish_reason").and_then(Value::as_str)),
-    }?;
-    Some(map_stop_reason(reason))
-}
-
 pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<String, ProxyError> {
     let text = String::from_utf8_lossy(body);
     let mut parser = SseParser::default();
@@ -481,8 +330,10 @@ pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<St
         if event == "[DONE]" {
             continue;
         }
-        if let Some(delta) = extract_stream_text(api_mode, &event) {
-            output.push_str(&delta);
+        for normalized_event in normalized_stream_events_from_openai(api_mode, &event) {
+            if let NormalizedStreamEvent::TextDelta(delta) = normalized_event {
+                output.push_str(&delta);
+            }
         }
     }
 
@@ -505,12 +356,6 @@ pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<St
 
 fn io_error<E: std::fmt::Display>(error: E) -> std::io::Error {
     std::io::Error::other(error.to_string())
-}
-
-struct StreamToolDelta {
-    id: String,
-    name: String,
-    arguments: String,
 }
 
 enum StreamBlockState {

@@ -1,6 +1,7 @@
 mod config;
 mod error;
 mod logging;
+mod normalized;
 mod protocol;
 mod server;
 mod streaming;
