@@ -1,5 +1,6 @@
 use anyhow::Result;
 use claude_adapter::{RunOptions, load_config, load_env_file, run};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 struct CliOptions {
@@ -9,6 +10,16 @@ struct CliOptions {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Err(error) = real_main().await {
+        eprintln!("Error: {error:#}");
+        wait_for_enter();
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn real_main() -> Result<()> {
     let options = parse_cli_options()?;
 
     if let Some(env_path) = &options.env_path {
@@ -29,6 +40,13 @@ async fn main() -> Result<()> {
         },
     )
     .await
+}
+
+fn wait_for_enter() {
+    eprint!("Press Enter to exit...");
+    let _ = io::stderr().flush();
+    let mut buffer = String::new();
+    let _ = io::stdin().read_line(&mut buffer);
 }
 
 fn parse_cli_options() -> Result<CliOptions> {
