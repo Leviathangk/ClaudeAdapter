@@ -340,16 +340,12 @@ async fn anthropic_messages_inner(
     );
 
     if !status.is_success() {
-        return Response::builder()
-            .status(status)
-            .header(axum::http::header::CONTENT_TYPE, "application/json")
-            .body(Body::from(body))
-            .map_err(|e| ProxyError::server_error(format!("failed to build response: {e}")));
+        return anthropic_error_response(status, &content_type, &body);
     }
 
     let response = if content_type.starts_with("text/event-stream") {
         let text = collect_text_from_sse(provider.api_mode, &body)?;
-        anthropic_text_response(&payload.model, &payload, text)
+        anthropic_text_response(&payload.model, &payload, text, None, None)
     } else {
         let upstream_json: Value = serde_json::from_slice(&body)
             .map_err(|e| ProxyError::bad_gateway(format!("invalid upstream json: {e}")))?;
@@ -379,19 +375,11 @@ async fn stream_anthropic_response(
         .to_string();
     tracing::info!(status = %status, content_type = %content_type, "anthropic upstream stream opened");
     if !status.is_success() {
-        let content_type = upstream
-            .headers()
-            .get(axum::http::header::CONTENT_TYPE)
-            .cloned()
-            .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-        let stream = upstream
-            .bytes_stream()
-            .map_err(|e| std::io::Error::other(format!("upstream stream error: {e}")));
-        return Response::builder()
-            .status(status)
-            .header(axum::http::header::CONTENT_TYPE, content_type)
-            .body(Body::from_stream(stream))
-            .map_err(|e| ProxyError::server_error(format!("failed to build response: {e}")));
+        let body = upstream.bytes().await.map_err(|e| {
+            tracing::error!(error = %e, "failed to read anthropic error upstream body");
+            ProxyError::bad_gateway(format!("failed to read upstream body: {e}"))
+        })?;
+        return anthropic_error_response(status, &content_type, &body);
     }
 
     if !content_type.starts_with("text/event-stream") {
@@ -635,7 +623,14 @@ async fn send_upstream_request(
     request = request.headers(outbound_headers);
     request.send().await.map_err(|e| {
         tracing::error!(url = %url, error = %e, "upstream request failed");
-        ProxyError::bad_gateway(format!("upstream request failed: {e}"))
+        let message = if e.is_timeout() {
+            "upstream request timed out".to_string()
+        } else if e.is_connect() {
+            format!("failed to connect to upstream: {e}")
+        } else {
+            format!("upstream request failed: {e}")
+        };
+        ProxyError::bad_gateway(message)
     })
 }
 
@@ -681,6 +676,8 @@ fn anthropic_content_to_text(content: &AnthropicContent) -> Option<String> {
         AnthropicContent::Text(text) => Some(text.clone()),
         AnthropicContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
             AnthropicContentBlock::Text { text, .. } => Some(text.clone()),
+            AnthropicContentBlock::ToolUse { .. } => None,
+            AnthropicContentBlock::ToolResult { .. } => None,
             AnthropicContentBlock::Other => None,
         }),
     }
@@ -703,10 +700,7 @@ fn anthropic_to_chat_completions(payload: &AnthropicMessagesRequest, target_mode
         messages.push(json!({ "role": "system", "content": system }));
     }
     for message in &payload.messages {
-        messages.push(json!({
-            "role": message.role,
-            "content": anthropic_content_to_text(&message.content).unwrap_or_default()
-        }));
+        messages.extend(anthropic_message_to_openai_messages(message));
     }
 
     let mut body = json!({
@@ -725,6 +719,7 @@ fn anthropic_to_chat_completions(payload: &AnthropicMessagesRequest, target_mode
     if let Some(stop_sequences) = &payload.stop_sequences {
         body["stop"] = json!(stop_sequences);
     }
+    apply_tools_to_openai_body(&mut body, payload);
     body
 }
 
@@ -737,13 +732,7 @@ fn anthropic_to_responses(
         lines.push(format!("System: {system}"));
     }
     for message in &payload.messages {
-        let role = match message.role.as_str() {
-            "user" => "User",
-            "assistant" => "Assistant",
-            _ => "User",
-        };
-        let text = anthropic_content_to_text(&message.content).unwrap_or_default();
-        lines.push(format!("{role}: {text}"));
+        lines.extend(anthropic_message_to_response_lines(message));
     }
     let input = lines.join("\n\n");
     if input.is_empty() {
@@ -765,7 +754,175 @@ fn anthropic_to_responses(
     if let Some(top_p) = payload.top_p {
         body["top_p"] = json!(top_p);
     }
+    apply_tools_to_openai_body(&mut body, payload);
     Ok(body)
+}
+
+fn apply_tools_to_openai_body(body: &mut Value, payload: &AnthropicMessagesRequest) {
+    if !payload.tools.is_empty() {
+        body["tools"] = json!(
+            payload
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    if let Some(tool_choice) = &payload.tool_choice {
+        body["tool_choice"] = anthropic_tool_choice_to_openai(tool_choice);
+    }
+}
+
+fn anthropic_tool_choice_to_openai(tool_choice: &AnthropicToolChoice) -> Value {
+    match tool_choice {
+        AnthropicToolChoice::Auto {} => json!("auto"),
+        AnthropicToolChoice::Any {} => json!("required"),
+        AnthropicToolChoice::Tool { name } => json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            }
+        }),
+    }
+}
+
+fn anthropic_message_to_openai_messages(message: &AnthropicMessage) -> Vec<Value> {
+    match &message.content {
+        AnthropicContent::Text(text) => vec![json!({
+            "role": message.role,
+            "content": text,
+        })],
+        AnthropicContent::Blocks(blocks) => {
+            let mut messages = Vec::new();
+            let text = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    AnthropicContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            let tool_calls = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    AnthropicContentBlock::ToolUse { id, name, input } => Some(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
+                        }
+                    })),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            log_ignored_content_blocks(blocks);
+
+            if !text.is_empty() || !tool_calls.is_empty() {
+                let mut assistant = json!({
+                    "role": message.role,
+                    "content": text,
+                });
+                if !tool_calls.is_empty() {
+                    assistant["tool_calls"] = json!(tool_calls);
+                }
+                messages.push(assistant);
+            }
+
+            for block in blocks {
+                if let AnthropicContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } = block
+                {
+                    let tool_content = anthropic_tool_result_text(content);
+                    let mut tool_message = json!({
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": tool_content,
+                    });
+                    if is_error.unwrap_or(false) {
+                        tool_message["content"] = json!(format!(
+                            "ERROR: {}",
+                            tool_message["content"].as_str().unwrap_or_default()
+                        ));
+                    }
+                    messages.push(tool_message);
+                }
+            }
+
+            messages
+        }
+    }
+}
+
+fn anthropic_message_to_response_lines(message: &AnthropicMessage) -> Vec<String> {
+    let mut lines = Vec::new();
+    let role = match message.role.as_str() {
+        "user" => "User",
+        "assistant" => "Assistant",
+        _ => "User",
+    };
+
+    if let Some(text) = anthropic_content_to_text(&message.content) {
+        if !text.is_empty() {
+            lines.push(format!("{role}: {text}"));
+        }
+    }
+
+    if let AnthropicContent::Blocks(blocks) = &message.content {
+        log_ignored_content_blocks(blocks);
+        for block in blocks {
+            match block {
+                AnthropicContentBlock::ToolUse { name, input, .. } => {
+                    lines.push(format!("Assistant tool_use {name}: {input}"));
+                }
+                AnthropicContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let prefix = if is_error.unwrap_or(false) {
+                        "Tool error"
+                    } else {
+                        "Tool result"
+                    };
+                    lines.push(format!(
+                        "{prefix} {tool_use_id}: {}",
+                        anthropic_tool_result_text(content)
+                    ));
+                }
+                AnthropicContentBlock::Text { .. } | AnthropicContentBlock::Other => {}
+            }
+        }
+    }
+
+    lines
+}
+
+fn anthropic_tool_result_text(content: &Value) -> String {
+    value_as_text(content).unwrap_or_else(|| content.to_string())
+}
+
+fn log_ignored_content_blocks(blocks: &[AnthropicContentBlock]) {
+    for block in blocks {
+        if matches!(block, AnthropicContentBlock::Other) {
+            tracing::info!("ignoring unsupported anthropic content block");
+        }
+    }
 }
 
 fn provider_response_to_anthropic(
@@ -774,19 +931,33 @@ fn provider_response_to_anthropic(
     request: &AnthropicMessagesRequest,
     upstream_json: Value,
 ) -> Result<AnthropicMessagesResponse, ProxyError> {
+    if let Some(response) =
+        extract_tool_use_response(api_mode, requested_model, request, &upstream_json)
+    {
+        return Ok(response);
+    }
+
     let text = match api_mode {
         ApiMode::ChatCompletions => extract_chat_completion_text(&upstream_json),
         ApiMode::Responses => extract_responses_text(&upstream_json),
     }
     .ok_or_else(|| ProxyError::bad_gateway("failed to extract text from upstream response"))?;
 
-    Ok(anthropic_text_response(requested_model, request, text))
+    Ok(anthropic_text_response(
+        requested_model,
+        request,
+        text,
+        extract_upstream_usage(&upstream_json),
+        extract_upstream_stop_reason(api_mode, &upstream_json),
+    ))
 }
 
 fn anthropic_text_response(
     requested_model: &str,
     request: &AnthropicMessagesRequest,
     text: String,
+    usage: Option<AnthropicUsage>,
+    stop_reason: Option<String>,
 ) -> AnthropicMessagesResponse {
     let output_tokens = estimate_token_count(&text);
     let input_text = request
@@ -800,18 +971,83 @@ fn anthropic_text_response(
         id: format!("msg_{}", simple_id()),
         message_type: "message".to_string(),
         role: "assistant".to_string(),
-        content: vec![AnthropicTextBlock {
-            block_type: "text".to_string(),
-            text,
-        }],
+        content: vec![AnthropicContentResponseBlock::Text { text }],
         model: requested_model.to_string(),
-        stop_reason: Some("end_turn".to_string()),
+        stop_reason: stop_reason.or_else(|| Some("end_turn".to_string())),
         stop_sequence: None,
-        usage: AnthropicUsage {
+        usage: usage.unwrap_or(AnthropicUsage {
             input_tokens: estimate_token_count(&input_text),
             output_tokens,
-        },
+        }),
     }
+}
+
+fn extract_tool_use_response(
+    api_mode: ApiMode,
+    requested_model: &str,
+    request: &AnthropicMessagesRequest,
+    upstream_json: &Value,
+) -> Option<AnthropicMessagesResponse> {
+    let (text, tool_calls) = match api_mode {
+        ApiMode::ChatCompletions => {
+            let message = upstream_json
+                .get("choices")?
+                .as_array()?
+                .first()?
+                .get("message")?;
+            let text = message.get("content").and_then(value_as_text);
+            let tool_calls = message.get("tool_calls")?.as_array()?;
+            (text, tool_calls)
+        }
+        ApiMode::Responses => (
+            upstream_json
+                .get("output_text")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            upstream_json.get("tool_calls")?.as_array()?,
+        ),
+    };
+
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    let mut content = Vec::new();
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        content.push(AnthropicContentResponseBlock::Text { text });
+    }
+    for call in tool_calls {
+        let id = call.get("id")?.as_str()?.to_string();
+        let function = call.get("function")?;
+        let name = function.get("name")?.as_str()?.to_string();
+        let input = function
+            .get("arguments")
+            .and_then(Value::as_str)
+            .and_then(|args| serde_json::from_str::<Value>(args).ok())
+            .unwrap_or_else(|| json!({}));
+        content.push(AnthropicContentResponseBlock::ToolUse { id, name, input });
+    }
+
+    Some(AnthropicMessagesResponse {
+        id: format!("msg_{}", simple_id()),
+        message_type: "message".to_string(),
+        role: "assistant".to_string(),
+        content,
+        model: requested_model.to_string(),
+        stop_reason: Some("tool_use".to_string()),
+        stop_sequence: None,
+        usage: extract_upstream_usage(upstream_json).unwrap_or_else(|| AnthropicUsage {
+            input_tokens: estimate_token_count(
+                &request
+                    .messages
+                    .iter()
+                    .filter_map(|message| anthropic_content_to_text(&message.content))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            output_tokens: 1,
+        }),
+    })
 }
 
 fn extract_chat_completion_text(value: &Value) -> Option<String> {
@@ -842,6 +1078,40 @@ fn extract_responses_text(value: &Value) -> Option<String> {
     None
 }
 
+fn extract_upstream_usage(value: &Value) -> Option<AnthropicUsage> {
+    let usage = value.get("usage")?;
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_i64)?;
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_i64)?;
+
+    Some(AnthropicUsage {
+        input_tokens,
+        output_tokens,
+    })
+}
+
+fn extract_upstream_stop_reason(api_mode: ApiMode, value: &Value) -> Option<String> {
+    let raw = match api_mode {
+        ApiMode::ChatCompletions => value
+            .get("choices")?
+            .as_array()?
+            .first()?
+            .get("finish_reason")
+            .and_then(Value::as_str),
+        ApiMode::Responses => value
+            .get("stop_reason")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("finish_reason").and_then(Value::as_str)),
+    }?;
+
+    Some(map_stop_reason(raw))
+}
+
 fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<String, ProxyError> {
     let text = String::from_utf8_lossy(body);
     let mut parser = SseParser::default();
@@ -864,6 +1134,55 @@ fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<String, Proxy
     }
 
     Ok(output)
+}
+
+fn anthropic_error_response(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    body: &[u8],
+) -> Result<Response<Body>, ProxyError> {
+    let message = extract_upstream_error_message(content_type, body)
+        .unwrap_or_else(|| format!("upstream request failed with status {status}"));
+    let payload = json!({
+        "type": "error",
+        "error": {
+            "type": "api_error",
+            "message": message,
+        }
+    });
+
+    Response::builder()
+        .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
+        .header(axum::http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::to_vec(&payload).map_err(|e| {
+            ProxyError::server_error(format!("failed to encode error response: {e}"))
+        })?))
+        .map_err(|e| ProxyError::server_error(format!("failed to build error response: {e}")))
+}
+
+fn extract_upstream_error_message(content_type: &str, body: &[u8]) -> Option<String> {
+    if content_type.starts_with("application/json") || content_type.starts_with("text/event-stream")
+    {
+        if let Ok(value) = serde_json::from_slice::<Value>(body) {
+            if let Some(message) = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+            {
+                return Some(message.to_string());
+            }
+            if let Some(message) = value.get("message").and_then(Value::as_str) {
+                return Some(message.to_string());
+            }
+        }
+    }
+
+    let preview = preview_text(&String::from_utf8_lossy(body), 400);
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview)
+    }
 }
 
 fn anthropic_sse_stream(
@@ -893,21 +1212,11 @@ fn anthropic_sse_stream(
                 }
             }),
         )?;
-        yield sse_event_bytes(
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {
-                    "type": "text",
-                    "text": ""
-                }
-            }),
-        )?;
 
         let mut parser = SseParser::default();
         let mut output_text = String::new();
         let mut stop_reason = "end_turn".to_string();
+        let mut active_block: Option<StreamBlockState> = None;
         let mut upstream_stream = upstream.bytes_stream();
         while let Some(chunk) = upstream_stream.try_next().await.map_err(|e| {
             tracing::error!(error = %e, "anthropic upstream stream read error");
@@ -918,8 +1227,83 @@ fn anthropic_sse_stream(
                 match event.as_str() {
                     "[DONE]" => {}
                     _ => {
+                        if let Some(tool_delta) = extract_stream_tool_delta(api_mode, &event) {
+                            let should_start = match &active_block {
+                                Some(StreamBlockState::ToolUse { id, name, .. }) => {
+                                    let incoming_id = if tool_delta.id.is_empty() { id } else { &tool_delta.id };
+                                    let incoming_name = if tool_delta.name.is_empty() { name } else { &tool_delta.name };
+                                    id != incoming_id || name != incoming_name
+                                }
+                                Some(StreamBlockState::Text) => true,
+                                None => true,
+                            };
+
+                            if should_start {
+                                if let Some(previous) = active_block.take() {
+                                    yield content_block_stop_event(previous.index())?;
+                                }
+                                yield sse_event_bytes(
+                                    "content_block_start",
+                                    json!({
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": {
+                                            "type": "tool_use",
+                                            "id": tool_delta.id,
+                                            "name": tool_delta.name,
+                                            "input": {}
+                                        }
+                                    }),
+                                )?;
+                                active_block = Some(StreamBlockState::ToolUse {
+                                    index: 0,
+                                    id: tool_delta.id.clone(),
+                                    name: tool_delta.name.clone(),
+                                });
+                            } else if let Some(StreamBlockState::ToolUse { id, name, .. }) = &mut active_block {
+                                if !tool_delta.id.is_empty() {
+                                    *id = tool_delta.id.clone();
+                                }
+                                if !tool_delta.name.is_empty() {
+                                    *name = tool_delta.name.clone();
+                                }
+                            }
+
+                            if !tool_delta.arguments.is_empty() {
+                                yield sse_event_bytes(
+                                    "content_block_delta",
+                                    json!({
+                                        "type": "content_block_delta",
+                                        "index": 0,
+                                        "delta": {
+                                            "type": "input_json_delta",
+                                            "partial_json": tool_delta.arguments
+                                        }
+                                    }),
+                                )?;
+                            }
+                        }
+
                         if let Some(text) = extract_stream_text(api_mode, &event) {
                             if !text.is_empty() {
+                                let start_text_block = !matches!(active_block, Some(StreamBlockState::Text));
+                                if start_text_block {
+                                    if let Some(previous) = active_block.take() {
+                                        yield content_block_stop_event(previous.index())?;
+                                    }
+                                    yield sse_event_bytes(
+                                        "content_block_start",
+                                        json!({
+                                            "type": "content_block_start",
+                                            "index": 0,
+                                            "content_block": {
+                                                "type": "text",
+                                                "text": ""
+                                            }
+                                        }),
+                                    )?;
+                                    active_block = Some(StreamBlockState::Text);
+                                }
                                 output_text.push_str(&text);
                                 yield sse_event_bytes(
                                     "content_block_delta",
@@ -943,13 +1327,12 @@ fn anthropic_sse_stream(
             }
         }
 
-        yield sse_event_bytes(
-            "content_block_stop",
-            json!({
-                "type": "content_block_stop",
-                "index": 0
-            }),
-        )?;
+        if let Some(previous) = active_block.take() {
+            yield content_block_stop_event(previous.index())?;
+            if matches!(previous, StreamBlockState::ToolUse { .. }) && stop_reason == "end_turn" {
+                stop_reason = "tool_use".to_string();
+            }
+        }
 
         yield sse_event_bytes(
             "message_delta",
@@ -969,13 +1352,17 @@ fn anthropic_sse_stream(
     }
 }
 
-fn anthropic_single_response_sse(response: AnthropicMessagesResponse) -> Result<Bytes, ProxyError> {
-    let text = response
-        .content
-        .first()
-        .map(|block| block.text.clone())
-        .unwrap_or_default();
+fn content_block_stop_event(index: usize) -> Result<Bytes, std::io::Error> {
+    sse_event_bytes(
+        "content_block_stop",
+        json!({
+            "type": "content_block_stop",
+            "index": index
+        }),
+    )
+}
 
+fn anthropic_single_response_sse(response: AnthropicMessagesResponse) -> Result<Bytes, ProxyError> {
     let mut chunks = Vec::new();
     chunks.push(
         sse_event_bytes(
@@ -999,46 +1386,88 @@ fn anthropic_single_response_sse(response: AnthropicMessagesResponse) -> Result<
         )
         .map_err(|e| ProxyError::server_error(format!("failed to encode sse event: {e}")))?,
     );
-    chunks.push(
-        sse_event_bytes(
-            "content_block_start",
-            json!({
+    for (index, block) in response.content.iter().enumerate() {
+        let block_start = match block {
+            AnthropicContentResponseBlock::Text { .. } => json!({
                 "type": "content_block_start",
-                "index": 0,
+                "index": index,
                 "content_block": {
                     "type": "text",
                     "text": ""
                 }
             }),
-        )
-        .map_err(|e| ProxyError::server_error(format!("failed to encode sse event: {e}")))?,
-    );
-    if !text.is_empty() {
+            AnthropicContentResponseBlock::ToolUse { id, name, .. } => json!({
+                "type": "content_block_start",
+                "index": index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": id,
+                    "name": name,
+                    "input": {}
+                }
+            }),
+        };
+        chunks.push(
+            sse_event_bytes("content_block_start", block_start).map_err(|e| {
+                ProxyError::server_error(format!("failed to encode sse event: {e}"))
+            })?,
+        );
+
+        match block {
+            AnthropicContentResponseBlock::Text { text } => {
+                if !text.is_empty() {
+                    chunks.push(
+                        sse_event_bytes(
+                            "content_block_delta",
+                            json!({
+                                "type": "content_block_delta",
+                                "index": index,
+                                "delta": {
+                                    "type": "text_delta",
+                                    "text": text
+                                }
+                            }),
+                        )
+                        .map_err(|e| {
+                            ProxyError::server_error(format!("failed to encode sse event: {e}"))
+                        })?,
+                    );
+                }
+            }
+            AnthropicContentResponseBlock::ToolUse { input, .. } => {
+                let partial_json = serde_json::to_string(input).map_err(|e| {
+                    ProxyError::server_error(format!("failed to encode tool input: {e}"))
+                })?;
+                chunks.push(
+                    sse_event_bytes(
+                        "content_block_delta",
+                        json!({
+                            "type": "content_block_delta",
+                            "index": index,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": partial_json
+                            }
+                        }),
+                    )
+                    .map_err(|e| {
+                        ProxyError::server_error(format!("failed to encode sse event: {e}"))
+                    })?,
+                );
+            }
+        }
+
         chunks.push(
             sse_event_bytes(
-                "content_block_delta",
+                "content_block_stop",
                 json!({
-                    "type": "content_block_delta",
-                    "index": 0,
-                    "delta": {
-                        "type": "text_delta",
-                        "text": text
-                    }
+                    "type": "content_block_stop",
+                    "index": index
                 }),
             )
             .map_err(|e| ProxyError::server_error(format!("failed to encode sse event: {e}")))?,
         );
     }
-    chunks.push(
-        sse_event_bytes(
-            "content_block_stop",
-            json!({
-                "type": "content_block_stop",
-                "index": 0
-            }),
-        )
-        .map_err(|e| ProxyError::server_error(format!("failed to encode sse event: {e}")))?,
-    );
     chunks.push(
         sse_event_bytes(
             "message_delta",
@@ -1088,29 +1517,109 @@ fn extract_stream_text(api_mode: ApiMode, raw: &str) -> Option<String> {
     }
 }
 
+fn extract_stream_tool_delta(api_mode: ApiMode, raw: &str) -> Option<StreamToolDelta> {
+    let value: Value = serde_json::from_str(raw).ok()?;
+    match api_mode {
+        ApiMode::ChatCompletions => {
+            let call = value
+                .get("choices")?
+                .as_array()?
+                .first()?
+                .get("delta")?
+                .get("tool_calls")?
+                .as_array()?
+                .first()?;
+            let function = call.get("function")?;
+            Some(StreamToolDelta {
+                id: call
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                name: function
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                arguments: function
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            })
+        }
+        ApiMode::Responses => {
+            let event_type = value.get("type")?.as_str()?;
+            match event_type {
+                "response.output_item.added" => {
+                    let item = value.get("item")?;
+                    if item.get("type")?.as_str()? != "function_call" {
+                        return None;
+                    }
+                    Some(StreamToolDelta {
+                        id: item
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: String::new(),
+                    })
+                }
+                "response.function_call_arguments.delta" => Some(StreamToolDelta {
+                    id: value
+                        .get("item_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    name: String::new(),
+                    arguments: value
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                }),
+                _ => None,
+            }
+        }
+    }
+}
+
 fn extract_responses_stream_text(value: &Value) -> Option<String> {
-    value
-        .get("delta")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            value
-                .get("output_text")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            value
-                .get("output")
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(|item| item.get("content"))
-                .and_then(Value::as_array)
-                .and_then(|items| items.first())
-                .and_then(|part| part.get("text"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
+    let event_type = value.get("type").and_then(Value::as_str);
+    match event_type {
+        Some("response.output_text.delta") => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        Some("response.output_item.added") => None,
+        _ => value
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                value
+                    .get("output_text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                value
+                    .get("output")
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|item| item.get("content"))
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|part| part.get("text"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            }),
+    }
 }
 
 fn extract_stream_stop_reason(api_mode: ApiMode, raw: &str) -> Option<String> {
@@ -1123,8 +1632,10 @@ fn extract_stream_stop_reason(api_mode: ApiMode, raw: &str) -> Option<String> {
             .get("finish_reason")
             .and_then(Value::as_str),
         ApiMode::Responses => value
-            .get("stop_reason")
+            .get("response")
+            .and_then(|response| response.get("stop_reason"))
             .and_then(Value::as_str)
+            .or_else(|| value.get("stop_reason").and_then(Value::as_str))
             .or_else(|| value.get("finish_reason").and_then(Value::as_str)),
     }?;
     Some(map_stop_reason(reason))
@@ -1134,9 +1645,34 @@ fn map_stop_reason(reason: &str) -> String {
     match reason {
         "length" | "max_tokens" => "max_tokens",
         "stop" | "end_turn" => "end_turn",
+        "tool_calls" | "function_call" => "tool_use",
         other => other,
     }
     .to_string()
+}
+
+struct StreamToolDelta {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+enum StreamBlockState {
+    Text,
+    ToolUse {
+        index: usize,
+        id: String,
+        name: String,
+    },
+}
+
+impl StreamBlockState {
+    fn index(&self) -> usize {
+        match self {
+            StreamBlockState::Text => 0,
+            StreamBlockState::ToolUse { index, .. } => *index,
+        }
+    }
 }
 
 fn io_error<E: std::fmt::Display>(error: E) -> std::io::Error {
@@ -1266,6 +1802,10 @@ struct AnthropicMessagesRequest {
     #[serde(default)]
     stop_sequences: Option<Vec<String>>,
     #[serde(default)]
+    tools: Vec<AnthropicTool>,
+    #[serde(default)]
+    tool_choice: Option<AnthropicToolChoice>,
+    #[serde(default)]
     stream: bool,
 }
 
@@ -1282,6 +1822,25 @@ struct AnthropicMessage {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct AnthropicTool {
+    name: String,
+    #[serde(default)]
+    description: String,
+    input_schema: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type")]
+enum AnthropicToolChoice {
+    #[serde(rename = "auto")]
+    Auto {},
+    #[serde(rename = "any")]
+    Any {},
+    #[serde(rename = "tool")]
+    Tool { name: String },
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum AnthropicContent {
     Text(String),
@@ -1293,6 +1852,19 @@ enum AnthropicContent {
 enum AnthropicContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
+    #[serde(rename = "tool_result")]
+    ToolResult {
+        tool_use_id: String,
+        content: Value,
+        #[serde(default)]
+        is_error: Option<bool>,
+    },
     #[serde(other)]
     Other,
 }
@@ -1303,7 +1875,7 @@ struct AnthropicMessagesResponse {
     #[serde(rename = "type")]
     message_type: String,
     role: String,
-    content: Vec<AnthropicTextBlock>,
+    content: Vec<AnthropicContentResponseBlock>,
     model: String,
     stop_reason: Option<String>,
     stop_sequence: Option<String>,
@@ -1311,10 +1883,16 @@ struct AnthropicMessagesResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct AnthropicTextBlock {
-    #[serde(rename = "type")]
-    block_type: String,
-    text: String,
+#[serde(tag = "type")]
+enum AnthropicContentResponseBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -1388,7 +1966,9 @@ impl ProxyError {
 
 fn error_response(error: ProxyError) -> Response<Body> {
     let body = Json(json!({
+        "type": "error",
         "error": {
+            "type": "api_error",
             "message": error.message,
         }
     }));
@@ -1541,6 +2121,82 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn normalizes_upstream_json_error_for_anthropic() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(429)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "error": {
+                        "message": "rate limit exceeded"
+                    }
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::ChatCompletions));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "api_error");
+        assert_eq!(json["error"]["message"], "rate limit exceeded");
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn reports_connect_error_for_anthropic() {
+        let app = build_router(test_config(
+            "http://127.0.0.1:1".to_string(),
+            ApiMode::ChatCompletions,
+        ));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(json["type"], "error");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("failed to connect to upstream")
+        );
     }
 
     #[tokio::test]
@@ -1714,6 +2370,247 @@ mod tests {
         assert_eq!(json["role"], "assistant");
         assert_eq!(json["content"][0]["text"], "hi");
         assert_eq!(json["model"], "claude-sonnet-4.6");
+        assert_eq!(json["stop_reason"], "end_turn");
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn preserves_usage_and_stop_reason_from_chat_completion_response() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [
+                        {
+                            "finish_reason": "length",
+                            "message": {"content": "hi"}
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 7
+                    }
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::ChatCompletions));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(json["stop_reason"], "max_tokens");
+        assert_eq!(json["usage"]["input_tokens"], 12);
+        assert_eq!(json["usage"]["output_tokens"], 7);
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn forwards_anthropic_tools_to_chat_completions() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .header("authorization", "Bearer provider-secret")
+                .json_body(json!({
+                    "model": "gpt-4.1-mini",
+                    "messages": [
+                        {"role": "user", "content": "hello"}
+                    ],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "Read",
+                                "description": "Read a file",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "path": {"type": "string"}
+                                    },
+                                    "required": ["path"]
+                                }
+                            }
+                        }
+                    ],
+                    "tool_choice": "required"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [
+                        {
+                            "message": {"content": "hi"}
+                        }
+                    ]
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::ChatCompletions));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "tools": [
+                                {
+                                    "name": "Read",
+                                    "description": "Read a file",
+                                    "input_schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "path": {"type": "string"}
+                                        },
+                                        "required": ["path"]
+                                    }
+                                }
+                            ],
+                            "tool_choice": {"type": "any"}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn converts_openai_tool_calls_to_anthropic_tool_use() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [
+                        {
+                            "message": {
+                                "tool_calls": [
+                                    {
+                                        "id": "call_123",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": "{\"path\":\"src/main.rs\"}"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::ChatCompletions));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(json["stop_reason"], "tool_use");
+        assert_eq!(json["content"][0]["type"], "tool_use");
+        assert_eq!(json["content"][0]["id"], "call_123");
+        assert_eq!(json["content"][0]["name"], "Read");
+        assert_eq!(json["content"][0]["input"]["path"], "src/main.rs");
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn preserves_text_alongside_tool_use_in_non_stream_response() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST).path("/chat/completions");
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [
+                        {
+                            "message": {
+                                "content": "I need to inspect a file first.",
+                                "tool_calls": [
+                                    {
+                                        "id": "call_123",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "Read",
+                                            "arguments": "{\"path\":\"src/main.rs\"}"
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::ChatCompletions));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [{"role": "user", "content": "hello"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = serde_json::from_slice::<Value>(&body).unwrap();
+        assert_eq!(json["content"][0]["type"], "text");
+        assert_eq!(
+            json["content"][0]["text"],
+            "I need to inspect a file first."
+        );
+        assert_eq!(json["content"][1]["type"], "tool_use");
+        assert_eq!(json["content"][1]["name"], "Read");
         upstream.assert();
     }
 
@@ -1817,6 +2714,409 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_anthropic_tools_to_responses() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer provider-secret")
+                .json_body(json!({
+                    "model": "o3",
+                    "input": "User: hello",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "Glob",
+                                "description": "Find files",
+                                "parameters": {
+                                    "type": "object",
+                                    "properties": {
+                                        "pattern": {"type": "string"}
+                                    },
+                                    "required": ["pattern"]
+                                }
+                            }
+                        }
+                    ],
+                    "tool_choice": {
+                        "type": "function",
+                        "function": {
+                            "name": "Glob"
+                        }
+                    }
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "output": [
+                        {
+                            "content": [
+                                {"text": "done"}
+                            ]
+                        }
+                    ]
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::Responses));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-opus-4-6",
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "tools": [
+                                {
+                                    "name": "Glob",
+                                    "description": "Find files",
+                                    "input_schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "pattern": {"type": "string"}
+                                        },
+                                        "required": ["pattern"]
+                                    }
+                                }
+                            ],
+                            "tool_choice": {"type": "tool", "name": "Glob"}
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn forwards_tool_result_to_chat_completions() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST)
+                .path("/chat/completions")
+                .header("authorization", "Bearer provider-secret")
+                .json_body(json!({
+                    "model": "gpt-4.1-mini",
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "call_123",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Read",
+                                        "arguments": "{\"path\":\"src/main.rs\"}"
+                                    }
+                                }
+                            ]
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "call_123",
+                            "content": "file content"
+                        }
+                    ]
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "choices": [
+                        {"message": {"content": "done"}}
+                    ]
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::ChatCompletions));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "id": "call_123",
+                                            "name": "Read",
+                                            "input": {"path": "src/main.rs"}
+                                        }
+                                    ]
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": "call_123",
+                                            "content": "file content"
+                                        }
+                                    ]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream.assert();
+    }
+
+    #[tokio::test]
+    async fn preserves_claude_code_like_multiturn_context_for_chat_completions() {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_route = Arc::clone(&captured);
+
+        let upstream_app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let captured_for_route = Arc::clone(&captured_for_route);
+                async move {
+                    captured_for_route.lock().unwrap().push(payload);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({
+                                "choices": [
+                                    {"message": {"content": "done"}}
+                                ]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let app = build_router(test_config(
+            format!("http://{address}"),
+            ApiMode::ChatCompletions,
+        ));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "system": [
+                                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.107"},
+                                {"type": "text", "text": "You are Claude Code."}
+                            ],
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [{"type": "text", "text": "read src/main.rs"}]
+                                },
+                                {
+                                    "role": "assistant",
+                                    "content": [
+                                        {"type": "text", "text": "I will inspect the file."},
+                                        {"type": "tool_use", "id": "call_123", "name": "Read", "input": {"path": "src/main.rs"}}
+                                    ]
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "tool_result", "tool_use_id": "call_123", "content": "fn main() {}"},
+                                        {"type": "text", "text": "continue"}
+                                    ]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0]["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "system");
+        assert!(
+            messages[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("x-anthropic-billing-header")
+        );
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["tool_calls"][0]["function"]["name"], "Read");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[4]["role"], "tool");
+        assert_eq!(messages[4]["tool_call_id"], "call_123");
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn ignores_unknown_anthropic_content_blocks_without_breaking_request() {
+        let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_for_route = Arc::clone(&captured);
+
+        let upstream_app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(payload): Json<Value>| {
+                let captured_for_route = Arc::clone(&captured_for_route);
+                async move {
+                    captured_for_route.lock().unwrap().push(payload);
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({
+                                "choices": [
+                                    {"message": {"content": "done"}}
+                                ]
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let app = build_router(test_config(
+            format!("http://{address}"),
+            ApiMode::ChatCompletions,
+        ));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {"type": "text", "text": "hello"},
+                                        {"type": "thinking", "thinking": "internal"},
+                                        {"type": "tool_result", "tool_use_id": "call_123", "content": "file content"}
+                                    ]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let messages = requests[0]["messages"].as_array().unwrap();
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_123");
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn forwards_tool_result_to_responses() {
+        let server = MockServer::start();
+        let upstream = server.mock(|when, then| {
+            when.method(POST)
+                .path("/responses")
+                .header("authorization", "Bearer provider-secret")
+                .json_body(json!({
+                    "model": "o3",
+                    "input": "Assistant tool_use Read: {\"path\":\"src/main.rs\"}\n\nTool result call_123: file content"
+                }));
+            then.status(200)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "output": [
+                        {"content": [{"text": "done"}]}
+                    ]
+                }));
+        });
+
+        let app = build_router(test_config(server.base_url(), ApiMode::Responses));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-opus-4-6",
+                            "messages": [
+                                {
+                                    "role": "assistant",
+                                    "content": [
+                                        {
+                                            "type": "tool_use",
+                                            "id": "call_123",
+                                            "name": "Read",
+                                            "input": {"path": "src/main.rs"}
+                                        }
+                                    ]
+                                },
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "tool_result",
+                                            "tool_use_id": "call_123",
+                                            "content": "file content"
+                                        }
+                                    ]
+                                }
+                            ]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        upstream.assert();
+    }
+
+    #[tokio::test]
     async fn streams_anthropic_messages_from_chat_completions() {
         let upstream_app = Router::new().route(
             "/chat/completions",
@@ -1887,6 +3187,130 @@ mod tests {
         assert!(text.contains("\"text\":\"lo\""));
         assert!(text.contains("event: message_delta"));
         assert!(text.contains("event: message_stop"));
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn streams_openai_tool_calls_to_anthropic_tool_use_events() {
+        let upstream_app = Router::new().route(
+            "/chat/completions",
+            post(|Json(_payload): Json<Value>| async move {
+                let stream = futures_util::stream::iter(vec![
+                    Ok::<Bytes, Infallible>(Bytes::from(
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call_123\",\"function\":{\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"}}]}}]}\n\n",
+                    )),
+                    Ok::<Bytes, Infallible>(Bytes::from(
+                        "data: {\"choices\":[{\"finish_reason\":\"tool_calls\"}]}\n\n",
+                    )),
+                    Ok::<Bytes, Infallible>(Bytes::from("data: [DONE]\n\n")),
+                ]);
+
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let app = build_router(test_config(
+            format!("http://{address}"),
+            ApiMode::ChatCompletions,
+        ));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-sonnet-4.6",
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "use a tool"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("event: content_block_start"));
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("\"name\":\"Read\""));
+        assert!(text.contains("\"type\":\"input_json_delta\""));
+        assert!(text.contains("\"stop_reason\":\"tool_use\""));
+
+        upstream_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn streams_openai_responses_tool_events_to_anthropic_tool_use() {
+        let upstream_app = Router::new().route(
+            "/responses",
+            post(|Json(_payload): Json<Value>| async move {
+                let stream = futures_util::stream::iter(vec![
+                    Ok::<Bytes, Infallible>(Bytes::from(
+                        "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_123\",\"name\":\"Read\"}}\n\n",
+                    )),
+                    Ok::<Bytes, Infallible>(Bytes::from(
+                        "event: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_123\",\"delta\":\"{\\\"path\\\":\\\"src/main.rs\\\"}\"}\n\n",
+                    )),
+                    Ok::<Bytes, Infallible>(Bytes::from(
+                        "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"stop_reason\":\"function_call\"}}\n\n",
+                    )),
+                ]);
+
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream_handle = tokio::spawn(async move {
+            axum::serve(listener, upstream_app).await.unwrap();
+        });
+
+        let app = build_router(test_config(format!("http://{address}"), ApiMode::Responses));
+        let response = app
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer incoming-secret")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-opus-4-6",
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "use a tool"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("\"type\":\"tool_use\""));
+        assert!(text.contains("\"name\":\"Read\""));
+        assert!(text.contains("\"type\":\"input_json_delta\""));
+        assert!(text.contains("\"stop_reason\":\"tool_use\""));
 
         upstream_handle.abort();
     }
