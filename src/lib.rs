@@ -1,9 +1,12 @@
 use std::{
     collections::HashMap,
     env,
+    fs::OpenOptions,
+    io::Write,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -246,6 +249,58 @@ async fn healthz() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
+pub fn append_error_log(stage: &str, details: &str) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+
+    let path = match env::current_dir() {
+        Ok(dir) => dir.join("error.log"),
+        Err(error) => {
+            tracing::error!(error = %error, "failed to resolve current directory for error.log");
+            return;
+        }
+    };
+
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::error!(path = %path.display(), error = %error, "failed to open error.log");
+            return;
+        }
+    };
+
+    let record =
+        format!("[{timestamp}] {stage}\n{details}\n----------------------------------------\n");
+
+    if let Err(error) = file.write_all(record.as_bytes()) {
+        tracing::error!(path = %path.display(), error = %error, "failed to write error.log");
+    }
+}
+
+pub fn install_panic_logger() {
+    std::panic::set_hook(Box::new(|panic_info| {
+        let location = panic_info
+            .location()
+            .map(|loc| format!("{}:{}:{}", loc.file(), loc.line(), loc.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+
+        append_error_log(
+            "panic",
+            &format!("location: {location}\npayload: {payload}"),
+        );
+    }));
+}
+
 async fn anthropic_messages_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -262,6 +317,10 @@ async fn anthropic_messages_handler(
                 error = %error,
                 body_preview = %body_preview,
                 "failed to parse anthropic request body"
+            );
+            append_error_log(
+                "failed to parse anthropic request body",
+                &format!("error: {error}\nbody_preview: {body_preview}"),
             );
             return error_response(ProxyError::bad_request(format!(
                 "invalid anthropic request body: {error}"
@@ -347,8 +406,16 @@ async fn anthropic_messages_inner(
         let text = collect_text_from_sse(provider.api_mode, &body)?;
         anthropic_text_response(&payload.model, &payload, text, None, None)
     } else {
-        let upstream_json: Value = serde_json::from_slice(&body)
-            .map_err(|e| ProxyError::bad_gateway(format!("invalid upstream json: {e}")))?;
+        let upstream_json: Value = serde_json::from_slice(&body).map_err(|e| {
+            append_error_log(
+                "invalid upstream json",
+                &format!(
+                    "error: {e}\ncontent_type: {content_type}\nbody_preview: {}",
+                    preview_text(&String::from_utf8_lossy(&body), 400)
+                ),
+            );
+            ProxyError::bad_gateway(format!("invalid upstream json: {e}"))
+        })?;
         provider_response_to_anthropic(provider.api_mode, &payload.model, &payload, upstream_json)?
     };
 
@@ -390,8 +457,13 @@ async fn stream_anthropic_response(
         let body_preview = preview_text(&String::from_utf8_lossy(&body), 400);
         tracing::info!(status = %status, content_type = %content_type, body_preview = %body_preview, "anthropic upstream json response");
 
-        let upstream_json: Value = serde_json::from_slice(&body)
-            .map_err(|e| ProxyError::bad_gateway(format!("invalid upstream json: {e}")))?;
+        let upstream_json: Value = serde_json::from_slice(&body).map_err(|e| {
+            append_error_log(
+                "invalid upstream json",
+                &format!("error: {e}\ncontent_type: {content_type}\nbody_preview: {body_preview}"),
+            );
+            ProxyError::bad_gateway(format!("invalid upstream json: {e}"))
+        })?;
         let response =
             provider_response_to_anthropic(api_mode, &request.model, request, upstream_json)?;
         let stream = anthropic_single_response_sse(response)?;
@@ -921,6 +993,10 @@ fn log_ignored_content_blocks(blocks: &[AnthropicContentBlock]) {
     for block in blocks {
         if matches!(block, AnthropicContentBlock::Other) {
             tracing::info!("ignoring unsupported anthropic content block");
+            append_error_log(
+                "ignoring unsupported anthropic content block",
+                &format!("block_debug: {block:?}"),
+            );
         }
     }
 }
@@ -941,7 +1017,13 @@ fn provider_response_to_anthropic(
         ApiMode::ChatCompletions => extract_chat_completion_text(&upstream_json),
         ApiMode::Responses => extract_responses_text(&upstream_json),
     }
-    .ok_or_else(|| ProxyError::bad_gateway("failed to extract text from upstream response"))?;
+    .ok_or_else(|| {
+        append_error_log(
+            "failed to extract text from upstream response",
+            &format!("api_mode: {:?}\nupstream_json: {}", api_mode, upstream_json),
+        );
+        ProxyError::bad_gateway("failed to extract text from upstream response")
+    })?;
 
     Ok(anthropic_text_response(
         requested_model,
@@ -1128,6 +1210,14 @@ fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<String, Proxy
     }
 
     if output.is_empty() {
+        append_error_log(
+            "failed to extract text from upstream sse response",
+            &format!(
+                "api_mode: {:?}\nsse_preview: {}",
+                api_mode,
+                preview_text(&text, 400)
+            ),
+        );
         return Err(ProxyError::bad_gateway(
             "failed to extract text from upstream sse response",
         ));
@@ -1965,6 +2055,10 @@ impl ProxyError {
 }
 
 fn error_response(error: ProxyError) -> Response<Body> {
+    append_error_log(
+        "proxy error",
+        &format!("status: {}\nmessage: {}", error.status, error.message),
+    );
     let body = Json(json!({
         "type": "error",
         "error": {

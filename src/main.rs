@@ -1,5 +1,7 @@
 use anyhow::Result;
-use claude_adapter::{RunOptions, load_config, load_env_file, run};
+use claude_adapter::{
+    RunOptions, append_error_log, install_panic_logger, load_config, load_env_file, run,
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -10,8 +12,11 @@ struct CliOptions {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    install_panic_logger();
+
     if let Err(error) = real_main().await {
         eprintln!("Error: {error:#}");
+        append_error_log("startup/runtime error", &format!("error: {error:#}"));
         wait_for_enter();
         return Err(error);
     }
