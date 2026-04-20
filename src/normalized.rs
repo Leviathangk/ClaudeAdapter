@@ -1,14 +1,14 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     config::ApiMode,
     error::ProxyError,
     logging::append_error_log,
     protocol::{
-        anthropic_content_to_text, estimate_token_count, extract_upstream_stop_reason,
-        extract_upstream_usage, map_stop_reason, value_as_text, AnthropicContent,
-        AnthropicContentBlock, AnthropicContentResponseBlock, AnthropicMessage,
+        AnthropicContent, AnthropicContentBlock, AnthropicContentResponseBlock, AnthropicMessage,
         AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicUsage,
+        anthropic_content_to_text, estimate_token_count, extract_upstream_stop_reason,
+        extract_upstream_usage, map_stop_reason, value_as_text,
     },
     rules::normalize_incoming_messages,
 };
@@ -125,7 +125,7 @@ fn normalized_block_from_anthropic(block: &AnthropicContentBlock) -> NormalizedB
             is_error,
         } => NormalizedBlock::ToolResult {
             tool_use_id: tool_use_id.clone(),
-            content: content.clone(),
+            content: sanitize_tool_result_content(content),
             is_error: is_error.unwrap_or(false),
         },
         AnthropicContentBlock::Thinking { data } => {
@@ -175,21 +175,26 @@ pub(crate) fn normalized_messages_to_chat_completions(
                 }
             }
             NormalizedRole::User => {
-                let mut pending_text = Vec::new();
+                let mut pending_parts = Vec::new();
                 for block in &message.blocks {
                     match block {
-                        NormalizedBlock::Text(text) => pending_text.push(text.clone()),
+                        NormalizedBlock::Text(_)
+                        | NormalizedBlock::Image(_)
+                        | NormalizedBlock::Document(_) => {
+                            pending_parts.extend(chat_content_parts_from_block(block));
+                        }
                         NormalizedBlock::ToolResult {
                             tool_use_id,
                             content,
                             is_error,
                         } => {
-                            if !pending_text.is_empty() {
+                            if let Some(content) =
+                                chat_message_content_from_parts(&std::mem::take(&mut pending_parts))
+                            {
                                 result.push(json!({
                                     "role": "user",
-                                    "content": pending_text.join("\n"),
+                                    "content": content,
                                 }));
-                                pending_text.clear();
                             }
 
                             let mut tool_message = json!({
@@ -209,10 +214,10 @@ pub(crate) fn normalized_messages_to_chat_completions(
                     }
                 }
 
-                if !pending_text.is_empty() {
+                if let Some(content) = chat_message_content_from_parts(&pending_parts) {
                     result.push(json!({
                         "role": "user",
-                        "content": strip_system_reminders(&pending_text.join("\n")),
+                        "content": content,
                     }));
                 }
             }
@@ -254,50 +259,87 @@ pub(crate) fn normalized_messages_to_chat_completions(
     result
 }
 
-pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessage]) -> String {
-    let mut lines = Vec::new();
+pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessage]) -> Vec<Value> {
+    let mut items = Vec::new();
 
     for message in messages {
         match message.role {
             NormalizedRole::SystemPrompt => {
-                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
-                if !text.is_empty() {
-                    lines.push(format!("System: {text}"));
+                if let Some(message_item) =
+                    responses_message_from_blocks("system", &message.blocks, false)
+                {
+                    items.push(message_item);
                 }
             }
             NormalizedRole::User => {
-                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
-                if !text.is_empty() {
-                    lines.push(format!("User: {text}"));
-                }
+                let mut pending_content = Vec::new();
+
                 for block in &message.blocks {
-                    if let NormalizedBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } = block
-                    {
-                        let prefix = if *is_error {
-                            "Tool error"
-                        } else {
-                            "Tool result"
-                        };
-                        lines.push(format!(
-                            "{prefix} {tool_use_id}: {}",
-                            anthropic_tool_result_text(content)
-                        ));
+                    match block {
+                        NormalizedBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } => {
+                            if !pending_content.is_empty() {
+                                items.push(responses_message(
+                                    "user",
+                                    std::mem::take(&mut pending_content),
+                                ));
+                            }
+                            items.push(json!({
+                                "type": "function_call_output",
+                                "id": format!("fco_{}", simple_id()),
+                                "call_id": tool_use_id,
+                                "output": responses_output_from_tool_result(content),
+                            }));
+                        }
+                        _ => {
+                            if let Some(content_item) =
+                                responses_content_item_from_block(block, false)
+                            {
+                                pending_content.push(content_item);
+                            }
+                        }
                     }
+                }
+
+                if !pending_content.is_empty() {
+                    items.push(responses_message("user", pending_content));
                 }
             }
             NormalizedRole::Assistant => {
-                let text = strip_system_reminders(&collect_text_blocks(&message.blocks));
-                if !text.is_empty() {
-                    lines.push(format!("Assistant: {text}"));
-                }
+                let mut pending_content = Vec::new();
+
                 for block in &message.blocks {
-                    if let NormalizedBlock::ToolUse { name, input, .. } = block {
-                        lines.push(format!("Assistant tool_use {name}: {input}"));
+                    match block {
+                        NormalizedBlock::ToolUse { id, name, input } => {
+                            if !pending_content.is_empty() {
+                                items.push(responses_message(
+                                    "assistant",
+                                    std::mem::take(&mut pending_content),
+                                ));
+                            }
+                            items.push(json!({
+                                "type": "function_call",
+                                "id": id,
+                                "call_id": id,
+                                "name": name,
+                                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
+                            }));
+                        }
+                        _ => {
+                            if let Some(content_item) =
+                                responses_content_item_from_block(block, true)
+                            {
+                                pending_content.push(content_item);
+                            }
+                        }
                     }
+                }
+
+                if !pending_content.is_empty() {
+                    items.push(responses_message("assistant", pending_content));
                 }
             }
             NormalizedRole::Progress
@@ -306,7 +348,7 @@ pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessa
         }
     }
 
-    lines.join("\n\n")
+    items
 }
 
 fn collect_text_blocks(blocks: &[NormalizedBlock]) -> String {
@@ -314,10 +356,320 @@ fn collect_text_blocks(blocks: &[NormalizedBlock]) -> String {
         .iter()
         .filter_map(|block| match block {
             NormalizedBlock::Text(text) => Some(text.clone()),
-            _ => special_block_to_context_text(block),
+            _ => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn sanitize_tool_result_content(content: &Value) -> Value {
+    let Some(entries) = content.as_array() else {
+        return content.clone();
+    };
+
+    let filtered = entries
+        .iter()
+        .filter(|entry| !is_tool_reference_block(entry))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if filtered.len() == entries.len() {
+        return content.clone();
+    }
+
+    if filtered.is_empty() {
+        return json!([{
+            "type": "text",
+            "text": "[Tool references removed - unsupported by upstream]",
+        }]);
+    }
+
+    Value::Array(filtered)
+}
+
+fn is_tool_reference_block(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("tool_reference")
+}
+
+fn chat_content_parts_from_block(block: &NormalizedBlock) -> Vec<Value> {
+    match block {
+        NormalizedBlock::Text(text) => chat_text_part(text).into_iter().collect(),
+        NormalizedBlock::Image(value) => chat_image_part_from_value(value)
+            .or_else(|| chat_attachment_fallback_part("image", value))
+            .into_iter()
+            .collect(),
+        NormalizedBlock::Document(value) => chat_document_parts_from_value(value),
+        _ => Vec::new(),
+    }
+}
+
+fn chat_message_content_from_parts(parts: &[Value]) -> Option<Value> {
+    if parts.is_empty() {
+        return None;
+    }
+
+    let all_text = parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"));
+    if all_text {
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.is_empty() {
+            None
+        } else {
+            Some(json!(text))
+        }
+    } else {
+        Some(Value::Array(parts.to_vec()))
+    }
+}
+
+fn chat_text_part(text: &str) -> Option<Value> {
+    let text = strip_system_reminders(text);
+    if text.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "type": "text",
+            "text": text,
+        }))
+    }
+}
+
+fn chat_image_part_from_value(value: &Value) -> Option<Value> {
+    let source = value.get("source")?;
+    let mut image_url = json!({});
+
+    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+        image_url["detail"] = json!(detail);
+    }
+
+    if let Some(url) = source
+        .get("image_url")
+        .or_else(|| source.get("url"))
+        .and_then(Value::as_str)
+    {
+        image_url["url"] = json!(url);
+        return Some(json!({
+            "type": "image_url",
+            "image_url": image_url,
+        }));
+    }
+
+    if source.get("type").and_then(Value::as_str) == Some("base64") {
+        let media_type = source
+            .get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        let data = source.get("data").and_then(Value::as_str)?;
+        image_url["url"] = json!(format!("data:{media_type};base64,{data}"));
+        return Some(json!({
+            "type": "image_url",
+            "image_url": image_url,
+        }));
+    }
+
+    None
+}
+
+fn chat_document_parts_from_value(value: &Value) -> Vec<Value> {
+    let Some(source) = value.get("source") else {
+        return Vec::new();
+    };
+
+    if source.get("type").and_then(Value::as_str) == Some("text") {
+        if let Some(text) = source.get("data").and_then(Value::as_str) {
+            return chat_text_part(text).into_iter().collect();
+        }
+    }
+
+    chat_attachment_fallback_part("document", value)
+        .into_iter()
+        .collect()
+}
+
+fn chat_attachment_fallback_part(kind: &str, value: &Value) -> Option<Value> {
+    let source = value.get("source");
+    let label = value
+        .get("filename")
+        .or_else(|| value.get("title"))
+        .or_else(|| source.and_then(|source| source.get("filename")))
+        .or_else(|| source.and_then(|source| source.get("file_id")))
+        .or_else(|| source.and_then(|source| source.get("url")))
+        .or_else(|| source.and_then(|source| source.get("file_url")))
+        .and_then(Value::as_str)
+        .map(|value| format!(": {value}"))
+        .unwrap_or_default();
+
+    chat_text_part(&format!("[{kind} attachment omitted{label}]"))
+}
+
+fn responses_message_from_blocks(
+    role: &str,
+    blocks: &[NormalizedBlock],
+    assistant_message: bool,
+) -> Option<Value> {
+    let content = blocks
+        .iter()
+        .filter_map(|block| responses_content_item_from_block(block, assistant_message))
+        .collect::<Vec<_>>();
+
+    if content.is_empty() {
+        None
+    } else {
+        Some(responses_message(role, content))
+    }
+}
+
+fn responses_message(role: &str, content: Vec<Value>) -> Value {
+    json!({
+        "type": "message",
+        "role": role,
+        "content": content,
+    })
+}
+
+fn responses_content_item_from_block(
+    block: &NormalizedBlock,
+    assistant_message: bool,
+) -> Option<Value> {
+    match block {
+        NormalizedBlock::Text(text) => {
+            let text = strip_system_reminders(text);
+            if text.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "type": if assistant_message { "output_text" } else { "input_text" },
+                    "text": text,
+                }))
+            }
+        }
+        NormalizedBlock::Image(value) => responses_input_image_from_value(value),
+        NormalizedBlock::Document(value) => responses_input_file_or_text_from_value(value),
+        _ => None,
+    }
+}
+
+fn responses_output_from_tool_result(content: &Value) -> Value {
+    if let Some(items) = responses_output_items_from_value(content) {
+        return Value::Array(items);
+    }
+
+    json!(anthropic_tool_result_text(content))
+}
+
+fn responses_output_items_from_value(content: &Value) -> Option<Vec<Value>> {
+    let items = match content {
+        Value::Array(entries) => entries
+            .iter()
+            .filter_map(responses_content_item_from_value)
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
+    if items.is_empty() { None } else { Some(items) }
+}
+
+fn responses_content_item_from_value(value: &Value) -> Option<Value> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("text") => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({"type": "input_text", "text": text})),
+        Some("image") => responses_input_image_from_value(value),
+        Some("document") => responses_input_file_or_text_from_value(value),
+        _ => None,
+    }
+}
+
+fn responses_input_image_from_value(value: &Value) -> Option<Value> {
+    let source = value.get("source")?;
+    let mut item = json!({ "type": "input_image" });
+
+    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+        item["detail"] = json!(detail);
+    }
+
+    if let Some(file_id) = source.get("file_id").and_then(Value::as_str) {
+        item["file_id"] = json!(file_id);
+        return Some(item);
+    }
+
+    if let Some(image_url) = source
+        .get("image_url")
+        .or_else(|| source.get("url"))
+        .and_then(Value::as_str)
+    {
+        item["image_url"] = json!(image_url);
+        return Some(item);
+    }
+
+    if source.get("type").and_then(Value::as_str) == Some("base64") {
+        let media_type = source
+            .get("media_type")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream");
+        let data = source.get("data").and_then(Value::as_str)?;
+        item["image_url"] = json!(format!("data:{media_type};base64,{data}"));
+        return Some(item);
+    }
+
+    None
+}
+
+fn responses_input_file_or_text_from_value(value: &Value) -> Option<Value> {
+    let source = value.get("source")?;
+
+    if source.get("type").and_then(Value::as_str) == Some("text") {
+        let text = source.get("data").and_then(Value::as_str)?;
+        if text.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "type": "input_text",
+            "text": text,
+        }));
+    }
+
+    let mut item = json!({ "type": "input_file" });
+
+    if let Some(detail) = value.get("detail").and_then(Value::as_str) {
+        item["detail"] = json!(detail);
+    }
+
+    if let Some(filename) = value
+        .get("filename")
+        .or_else(|| value.get("title"))
+        .or_else(|| source.get("filename"))
+        .and_then(Value::as_str)
+    {
+        item["filename"] = json!(filename);
+    }
+
+    if let Some(file_id) = source.get("file_id").and_then(Value::as_str) {
+        item["file_id"] = json!(file_id);
+        return Some(item);
+    }
+
+    if let Some(file_url) = source
+        .get("file_url")
+        .or_else(|| source.get("url"))
+        .and_then(Value::as_str)
+    {
+        item["file_url"] = json!(file_url);
+        return Some(item);
+    }
+
+    if let Some(file_data) = source.get("data").and_then(Value::as_str) {
+        item["file_data"] = json!(file_data);
+        return Some(item);
+    }
+
+    None
 }
 
 pub(crate) fn normalized_response_from_openai(
@@ -397,7 +749,7 @@ fn normalized_response_from_responses(
 
     if let Some(tool_calls) = upstream_json.get("tool_calls").and_then(Value::as_array) {
         for call in tool_calls {
-            let Some(id) = call.get("id").and_then(Value::as_str) else {
+            let Some(id) = responses_function_call_id(call) else {
                 continue;
             };
             let Some(function) = call.get("function") else {
@@ -412,7 +764,7 @@ fn normalized_response_from_responses(
                 .and_then(|args| serde_json::from_str::<Value>(args).ok())
                 .unwrap_or_else(|| json!({}));
             blocks.push(NormalizedBlock::ToolUse {
-                id: id.to_string(),
+                id,
                 name: name.to_string(),
                 input,
             });
@@ -437,11 +789,11 @@ fn normalized_response_from_responses(
                     }
                 }
                 "function_call" => {
-                    let id = item.get("id").and_then(Value::as_str).unwrap_or_default();
+                    let id = responses_function_call_id(item).unwrap_or_default();
                     let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                     let input = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
                     blocks.push(NormalizedBlock::ToolUse {
-                        id: id.to_string(),
+                        id,
                         name: name.to_string(),
                         input: if input.is_string() {
                             input
@@ -567,23 +919,6 @@ fn anthropic_tool_result_text(content: &Value) -> String {
     strip_system_reminders(&value_as_text(content).unwrap_or_else(|| content.to_string()))
 }
 
-fn special_block_to_context_text(block: &NormalizedBlock) -> Option<String> {
-    match block {
-        NormalizedBlock::Thinking(value) => Some(format!("[thinking] {value}")),
-        NormalizedBlock::RedactedThinking(value) => Some(format!("[redacted_thinking] {value}")),
-        NormalizedBlock::Image(value) => Some(format!("[image] {value}")),
-        NormalizedBlock::Document(value) => Some(format!("[document] {value}")),
-        NormalizedBlock::ServerToolUse(value) => Some(format!("[server_tool_use] {value}")),
-        NormalizedBlock::McpToolUse(value) => Some(format!("[mcp_tool_use] {value}")),
-        NormalizedBlock::McpToolResult(value) => Some(format!("[mcp_tool_result] {value}")),
-        NormalizedBlock::CodeExecutionToolResult(value) => {
-            Some(format!("[code_execution_tool_result] {value}"))
-        }
-        NormalizedBlock::ContainerUpload(value) => Some(format!("[container_upload] {value}")),
-        _ => None,
-    }
-}
-
 fn simple_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -682,11 +1017,7 @@ fn normalized_stream_events_from_responses_event(
                 return None;
             }
             Some(vec![NormalizedStreamEvent::ToolUseStart {
-                id: item
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                id: responses_function_call_id(item).unwrap_or_default(),
                 name: item
                     .get("name")
                     .and_then(Value::as_str)
@@ -710,4 +1041,11 @@ fn normalized_stream_events_from_responses_event(
             .map(|reason| vec![NormalizedStreamEvent::StopReason(map_stop_reason(reason))]),
         _ => None,
     }
+}
+
+fn responses_function_call_id(item: &Value) -> Option<String> {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .map(|id| id.to_string())
 }

@@ -56,5 +56,12 @@ pub(crate) fn error_response(error: ProxyError) -> Response<Body> {
             "message": error.message,
         }
     }));
-    (error.status, body).into_response()
+    let mut response = (error.status, body).into_response();
+    if error.status.is_client_error() && error.status != StatusCode::TOO_MANY_REQUESTS {
+        response.headers_mut().insert(
+            "x-should-retry",
+            axum::http::HeaderValue::from_static("false"),
+        );
+    }
+    response
 }

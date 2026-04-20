@@ -3,7 +3,7 @@ use axum::{
     http::{Response, StatusCode},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::{
     config::{ApiMode, ProviderConfig},
@@ -35,12 +35,36 @@ pub(crate) struct AnthropicMessagesRequest {
     #[serde(default)]
     pub(crate) tool_choice: Option<AnthropicToolChoice>,
     #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) betas: Vec<String>,
+    #[serde(default)]
+    pub(crate) metadata: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) thinking: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) context_management: Option<Value>,
+    #[serde(default)]
+    pub(crate) output_config: Option<Value>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) speed: Option<String>,
+    #[serde(default)]
     pub(crate) stream: bool,
 }
 
 impl AnthropicMessagesRequest {
     pub(crate) fn system_text(&self) -> Option<String> {
         self.system.as_ref().and_then(anthropic_content_to_text)
+    }
+
+    fn metadata_object(&self) -> Option<&Map<String, Value>> {
+        self.metadata.as_ref()?.as_object()
+    }
+
+    fn output_config_object(&self) -> Option<&Map<String, Value>> {
+        self.output_config.as_ref()?.as_object()
     }
 }
 
@@ -260,21 +284,29 @@ pub(crate) fn extract_anthropic_message_preview(payload: &AnthropicMessagesReque
 pub(crate) fn anthropic_content_to_text(content: &AnthropicContent) -> Option<String> {
     match content {
         AnthropicContent::Text(text) => Some(text.clone()),
-        AnthropicContent::Blocks(blocks) => blocks.iter().find_map(|block| match block {
-            AnthropicContentBlock::Text { text } => Some(text.clone()),
-            AnthropicContentBlock::ToolUse { .. } => None,
-            AnthropicContentBlock::ToolResult { .. } => None,
-            AnthropicContentBlock::Thinking { .. } => None,
-            AnthropicContentBlock::RedactedThinking { .. } => None,
-            AnthropicContentBlock::Image { .. } => None,
-            AnthropicContentBlock::Document { .. } => None,
-            AnthropicContentBlock::ServerToolUse { .. } => None,
-            AnthropicContentBlock::McpToolUse { .. } => None,
-            AnthropicContentBlock::McpToolResult { .. } => None,
-            AnthropicContentBlock::CodeExecutionToolResult { .. } => None,
-            AnthropicContentBlock::ContainerUpload { .. } => None,
-            AnthropicContentBlock::Other => None,
-        }),
+        AnthropicContent::Blocks(blocks) => {
+            let text = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    AnthropicContentBlock::Text { text } => Some(text.as_str()),
+                    AnthropicContentBlock::ToolUse { .. }
+                    | AnthropicContentBlock::ToolResult { .. }
+                    | AnthropicContentBlock::Thinking { .. }
+                    | AnthropicContentBlock::RedactedThinking { .. }
+                    | AnthropicContentBlock::Image { .. }
+                    | AnthropicContentBlock::Document { .. }
+                    | AnthropicContentBlock::ServerToolUse { .. }
+                    | AnthropicContentBlock::McpToolUse { .. }
+                    | AnthropicContentBlock::McpToolResult { .. }
+                    | AnthropicContentBlock::CodeExecutionToolResult { .. }
+                    | AnthropicContentBlock::ContainerUpload { .. }
+                    | AnthropicContentBlock::Other => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if text.is_empty() { None } else { Some(text) }
+        }
     }
 }
 
@@ -310,6 +342,7 @@ fn anthropic_to_chat_completions(payload: &AnthropicMessagesRequest, target_mode
         body["stop"] = json!(stop_sequences);
     }
     apply_tools_to_chat_completions_body(&mut body, payload);
+    apply_request_options_to_chat_completions_body(&mut body, payload);
     body
 }
 
@@ -339,25 +372,28 @@ fn anthropic_to_responses(
         body["top_p"] = json!(top_p);
     }
     apply_tools_to_responses_body(&mut body, payload);
+    apply_request_options_to_responses_body(&mut body, payload);
     Ok(body)
 }
 
 fn apply_tools_to_chat_completions_body(body: &mut Value, payload: &AnthropicMessagesRequest) {
     if !payload.tools.is_empty() {
-        body["tools"] = json!(payload
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.input_schema,
-                    }
+        body["tools"] = json!(
+            payload
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "function": {
+                            "name": tool.name,
+                            "description": tool.description,
+                            "parameters": tool.input_schema,
+                        }
+                    })
                 })
-            })
-            .collect::<Vec<_>>());
+                .collect::<Vec<_>>()
+        );
     }
 
     if let Some(tool_choice) = &payload.tool_choice {
@@ -367,23 +403,143 @@ fn apply_tools_to_chat_completions_body(body: &mut Value, payload: &AnthropicMes
 
 fn apply_tools_to_responses_body(body: &mut Value, payload: &AnthropicMessagesRequest) {
     if !payload.tools.is_empty() {
-        body["tools"] = json!(payload
-            .tools
-            .iter()
-            .map(|tool| {
-                json!({
-                    "type": "function",
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
+        body["tools"] = json!(
+            payload
+                .tools
+                .iter()
+                .map(|tool| {
+                    json!({
+                        "type": "function",
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    })
                 })
-            })
-            .collect::<Vec<_>>());
+                .collect::<Vec<_>>()
+        );
     }
 
     if let Some(tool_choice) = &payload.tool_choice {
         body["tool_choice"] = anthropic_tool_choice_to_responses(tool_choice);
     }
+}
+
+fn apply_request_options_to_chat_completions_body(
+    body: &mut Value,
+    payload: &AnthropicMessagesRequest,
+) {
+    if let Some(metadata) = payload.metadata_object() {
+        body["metadata"] = Value::Object(metadata.clone());
+    }
+
+    if let Some(effort) = payload
+        .output_config_object()
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .and_then(openai_reasoning_effort)
+    {
+        body["reasoning_effort"] = json!(effort);
+    }
+
+    if let Some(format) = payload
+        .output_config_object()
+        .and_then(|config| config.get("format"))
+        .and_then(anthropic_output_format_to_chat_completions)
+    {
+        body["response_format"] = format;
+    }
+}
+
+fn apply_request_options_to_responses_body(body: &mut Value, payload: &AnthropicMessagesRequest) {
+    if let Some(metadata) = payload.metadata_object() {
+        body["metadata"] = Value::Object(metadata.clone());
+    }
+
+    if let Some(effort) = payload
+        .output_config_object()
+        .and_then(|config| config.get("effort"))
+        .and_then(Value::as_str)
+        .and_then(openai_reasoning_effort)
+    {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+
+    if let Some(format) = payload
+        .output_config_object()
+        .and_then(|config| config.get("format"))
+        .and_then(anthropic_output_format_to_responses)
+    {
+        body["text"] = json!({ "format": format });
+    }
+}
+
+fn openai_reasoning_effort(effort: &str) -> Option<&'static str> {
+    match effort {
+        "minimal" => Some("minimal"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "max" => Some("xhigh"),
+        _ => None,
+    }
+}
+
+fn anthropic_output_format_to_chat_completions(format: &Value) -> Option<Value> {
+    match format.get("type").and_then(Value::as_str) {
+        Some("json_object") => Some(json!({ "type": "json_object" })),
+        Some("json_schema") => {
+            let schema = format.get("schema")?.clone();
+            let mut json_schema = json!({
+                "name": output_format_name(format),
+                "schema": schema,
+            });
+
+            if let Some(description) = format.get("description").and_then(Value::as_str) {
+                json_schema["description"] = json!(description);
+            }
+            if let Some(strict) = format.get("strict").and_then(Value::as_bool) {
+                json_schema["strict"] = json!(strict);
+            }
+
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": json_schema,
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn anthropic_output_format_to_responses(format: &Value) -> Option<Value> {
+    match format.get("type").and_then(Value::as_str) {
+        Some("json_object") => Some(json!({ "type": "json_object" })),
+        Some("json_schema") => {
+            let schema = format.get("schema")?.clone();
+            let mut mapped = json!({
+                "type": "json_schema",
+                "name": output_format_name(format),
+                "schema": schema,
+            });
+
+            if let Some(description) = format.get("description").and_then(Value::as_str) {
+                mapped["description"] = json!(description);
+            }
+            if let Some(strict) = format.get("strict").and_then(Value::as_bool) {
+                mapped["strict"] = json!(strict);
+            }
+
+            Some(mapped)
+        }
+        _ => None,
+    }
+}
+
+fn output_format_name(format: &Value) -> &str {
+    format
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("claude_code_output")
 }
 
 fn anthropic_tool_choice_to_chat_completions(tool_choice: &AnthropicToolChoice) -> Value {
@@ -550,28 +706,39 @@ pub(crate) fn map_stop_reason(reason: &str) -> String {
 }
 
 pub(crate) fn value_as_text(value: &Value) -> Option<String> {
-    match value {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => {
-            for item in items {
-                if let Some(text) = value_as_text(item) {
-                    if !text.is_empty() {
-                        return Some(text);
-                    }
+    fn collect(value: &Value, fragments: &mut Vec<String>) {
+        match value {
+            Value::String(text) => {
+                if !text.is_empty() {
+                    fragments.push(text.clone());
                 }
             }
-            None
-        }
-        Value::Object(map) => {
-            if let Some(text) = map.get("text").and_then(Value::as_str) {
-                return Some(text.to_string());
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, fragments);
+                }
             }
-            if let Some(content) = map.get("content") {
-                return value_as_text(content);
+            Value::Object(map) => {
+                if let Some(text) = map.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        fragments.push(text.to_string());
+                    }
+                    return;
+                }
+                if let Some(content) = map.get("content") {
+                    collect(content, fragments);
+                }
             }
-            None
+            _ => {}
         }
-        _ => None,
+    }
+
+    let mut fragments = Vec::new();
+    collect(value, &mut fragments);
+    if fragments.is_empty() {
+        None
+    } else {
+        Some(fragments.join("\n"))
     }
 }
 

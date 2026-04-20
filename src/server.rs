@@ -15,12 +15,15 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 
 use crate::{
-    config::{Config, ProviderConfig, RunOptions, log_startup_config, mapped_model, start_watchers, validate_bind},
+    config::{
+        Config, ProviderConfig, RunOptions, log_startup_config, mapped_model, start_watchers,
+        validate_bind,
+    },
     error::{ProxyError, error_response},
     logging::{append_error_log, preview_text},
     protocol::{
-        AnthropicMessagesRequest, anthropic_error_response, anthropic_to_provider_request,
-        anthropic_text_response, extract_anthropic_message_preview, extract_message_preview,
+        AnthropicMessagesRequest, anthropic_error_response, anthropic_text_response,
+        anthropic_to_provider_request, extract_anthropic_message_preview, extract_message_preview,
         provider_response_to_anthropic,
     },
     streaming::{anthropic_single_response_sse, anthropic_sse_stream, collect_text_from_sse},
@@ -40,7 +43,10 @@ pub fn build_router(config: Config) -> Router {
 }
 
 fn build_router_with_shared_config(config: Arc<RwLock<Config>>) -> Router {
-    let state = AppState { config, client: Client::new() };
+    let state = AppState {
+        config,
+        client: Client::new(),
+    };
 
     Router::new()
         .route("/healthz", get(healthz))
@@ -79,6 +85,11 @@ async fn anthropic_messages_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
+    let config = current_config(&state).await;
+    if let Err(err) = authorize_incoming("v1_messages", &config, &headers) {
+        return error_response(err);
+    }
+
     let raw_body = String::from_utf8_lossy(&body).to_string();
     let body_preview = preview_text(&raw_body, 400);
     tracing::info!(body_preview = %body_preview, "incoming anthropic raw body");
@@ -97,7 +108,7 @@ async fn anthropic_messages_handler(
         }
     };
 
-    match anthropic_messages_inner(state, headers, payload).await {
+    match anthropic_messages_inner(state, payload).await {
         Ok(response) => response,
         Err(err) => error_response(err),
     }
@@ -121,11 +132,9 @@ async fn responses_handler(
 
 async fn anthropic_messages_inner(
     state: AppState,
-    headers: HeaderMap,
     payload: AnthropicMessagesRequest,
 ) -> Result<Response<Body>, ProxyError> {
     let config = current_config(&state).await;
-    authorize_incoming(&config, &headers)?;
 
     let provider = active_provider(&config)?;
     let target_model = mapped_model(provider, &payload.model);
@@ -186,10 +195,9 @@ async fn anthropic_messages_inner(
     Response::builder()
         .status(axum::http::StatusCode::OK)
         .header(axum::http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&response)
-                .map_err(|e| ProxyError::server_error(format!("failed to encode response: {e}")))?,
-        ))
+        .body(Body::from(serde_json::to_vec(&response).map_err(|e| {
+            ProxyError::server_error(format!("failed to encode response: {e}"))
+        })?))
         .map_err(|e| ProxyError::server_error(format!("failed to build response: {e}")))
 }
 
@@ -229,7 +237,8 @@ async fn stream_anthropic_response(
             );
             ProxyError::bad_gateway(format!("invalid upstream json: {e}"))
         })?;
-        let response = provider_response_to_anthropic(api_mode, &request.model, request, upstream_json)?;
+        let response =
+            provider_response_to_anthropic(api_mode, &request.model, request, upstream_json)?;
         let stream = anthropic_single_response_sse(response)?;
 
         return Response::builder()
@@ -278,7 +287,7 @@ async fn proxy_request_inner(
     local_endpoint: &'static str,
 ) -> Result<Response<Body>, ProxyError> {
     let config = current_config(&state).await;
-    authorize_incoming(&config, &headers)?;
+    authorize_incoming(local_endpoint, &config, &headers)?;
 
     let requested_model = payload
         .get("model")
@@ -304,7 +313,10 @@ async fn proxy_request_inner(
     let upstream = send_upstream_request(&state, provider, payload.clone()).await?;
 
     let status = upstream.status();
-    let content_type = upstream.headers().get(axum::http::header::CONTENT_TYPE).cloned();
+    let content_type = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .cloned();
     let content_type_text = content_type
         .as_ref()
         .and_then(|v| v.to_str().ok())
@@ -316,7 +328,11 @@ async fn proxy_request_inner(
         response = response.header(axum::http::header::CONTENT_TYPE, content_type.clone());
     }
 
-    if let Some(cache_control) = upstream.headers().get(axum::http::header::CACHE_CONTROL).cloned() {
+    if let Some(cache_control) = upstream
+        .headers()
+        .get(axum::http::header::CACHE_CONTROL)
+        .cloned()
+    {
         response = response.header(axum::http::header::CACHE_CONTROL, cache_control);
     }
 
@@ -343,13 +359,22 @@ async fn proxy_request_inner(
 }
 
 fn is_streaming_request(payload: &Value) -> bool {
-    payload.get("stream").and_then(Value::as_bool).unwrap_or(false)
+    payload
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn active_provider(config: &Config) -> Result<&ProviderConfig, ProxyError> {
-    config.providers.get(&config.activate_provider).ok_or_else(|| {
-        ProxyError::server_error(format!("active provider not found: {}", config.activate_provider))
-    })
+    config
+        .providers
+        .get(&config.activate_provider)
+        .ok_or_else(|| {
+            ProxyError::server_error(format!(
+                "active provider not found: {}",
+                config.activate_provider
+            ))
+        })
 }
 
 async fn send_upstream_request(
@@ -365,8 +390,9 @@ async fn send_upstream_request(
     for (name, value) in &provider.headers {
         let header_name = HeaderName::from_bytes(name.as_bytes())
             .map_err(|e| ProxyError::server_error(format!("invalid header name '{name}': {e}")))?;
-        let header_value = HeaderValue::from_str(value)
-            .map_err(|e| ProxyError::server_error(format!("invalid header value for '{name}': {e}")))?;
+        let header_value = HeaderValue::from_str(value).map_err(|e| {
+            ProxyError::server_error(format!("invalid header value for '{name}': {e}"))
+        })?;
         outbound_headers.insert(header_name, header_value);
     }
 
@@ -392,7 +418,11 @@ async fn send_upstream_request(
     })
 }
 
-fn authorize_incoming(config: &Config, headers: &HeaderMap) -> Result<(), ProxyError> {
+fn authorize_incoming(
+    endpoint: &'static str,
+    config: &Config,
+    headers: &HeaderMap,
+) -> Result<(), ProxyError> {
     let Some(expected) = &config.incoming_api_key else {
         return Ok(());
     };
@@ -404,11 +434,38 @@ fn authorize_incoming(config: &Config, headers: &HeaderMap) -> Result<(), ProxyE
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(|s| s.to_string())
-        .or_else(|| headers.get("x-api-key").and_then(|value| value.to_str().ok()).map(|s| s.to_string()));
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                .map(|s| s.to_string())
+        });
 
     match actual.as_deref() {
         Some(token) if token == expected => Ok(()),
-        _ => Err(ProxyError::unauthorized("invalid bearer token")),
+        _ => {
+            tracing::warn!(
+                endpoint,
+                auth_source = incoming_auth_source(headers),
+                has_bearer = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.starts_with("Bearer "))
+                    .unwrap_or(false),
+                "incoming authorization rejected"
+            );
+            Err(ProxyError::unauthorized("invalid bearer token"))
+        }
+    }
+}
+
+fn incoming_auth_source(headers: &HeaderMap) -> &'static str {
+    if headers.contains_key(axum::http::header::AUTHORIZATION) {
+        "authorization"
+    } else if headers.contains_key("x-api-key") {
+        "x-api-key"
+    } else {
+        "none"
     }
 }
 
@@ -424,7 +481,8 @@ fn provider_url(provider: &ProviderConfig) -> Result<String, ProxyError> {
 
 fn resolve_secret(raw: &str) -> Result<String> {
     if let Some(key) = raw.strip_prefix("env:") {
-        let value = env::var(key).with_context(|| format!("missing environment variable: {key}"))?;
+        let value =
+            env::var(key).with_context(|| format!("missing environment variable: {key}"))?;
         if value.is_empty() {
             return Err(anyhow!("environment variable is empty: {key}"));
         }
