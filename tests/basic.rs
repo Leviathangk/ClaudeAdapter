@@ -184,6 +184,98 @@ async fn normalizes_upstream_json_error_for_anthropic() {
 }
 
 #[tokio::test]
+async fn normalizes_context_window_json_error_to_prompt_too_long() {
+    let server = MockServer::start();
+    let upstream = server.mock(|when, then| {
+        when.method(POST).path("/responses");
+        then.status(400)
+            .header("content-type", "application/json")
+            .json_body(json!({
+                "error": {
+                    "code": "context_length_exceeded",
+                    "message": "Your input exceeds the context window of this model. Please adjust your input and try again."
+                }
+            }));
+    });
+
+    let app = build_router(test_config(server.base_url(), ApiMode::Responses));
+    let response = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer incoming-secret")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = serde_json::from_slice::<Value>(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.starts_with("Prompt is too long:"));
+    assert!(message.contains("context window"));
+    upstream.assert();
+}
+
+#[tokio::test]
+async fn normalizes_context_window_sse_failure_to_prompt_too_long() {
+    let upstream_app = Router::new().route(
+        "/responses",
+        post(|Json(_payload): Json<Value>| async move {
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from(
+                    "event: response.failed\n\
+                     data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_123\",\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\"}}}\n\n",
+                ))
+                .unwrap()
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.unwrap();
+    });
+
+    let app = build_router(test_config(format!("http://{address}"), ApiMode::Responses));
+    let response = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer incoming-secret")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let json = serde_json::from_slice::<Value>(&body).unwrap();
+    let message = json["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("Prompt is too long"));
+    assert!(message.contains("context window"));
+
+    handle.abort();
+}
+
+#[tokio::test]
 async fn concatenates_all_system_text_blocks_before_chat_completion_request() {
     let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
     let captured_for_route = Arc::clone(&captured);

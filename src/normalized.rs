@@ -1,9 +1,10 @@
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{
     config::ApiMode,
     error::ProxyError,
-    logging::append_error_log,
+    logging::{append_error_log, preview_text},
     protocol::{
         AnthropicContent, AnthropicContentBlock, AnthropicContentResponseBlock, AnthropicMessage,
         AnthropicMessagesRequest, AnthropicMessagesResponse, AnthropicUsage,
@@ -12,6 +13,13 @@ use crate::{
     },
     rules::normalize_incoming_messages,
 };
+
+static UNHANDLED_RESPONSES_EVENT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
+const MAX_UNHANDLED_RESPONSES_EVENT_LOGS: usize = 20;
+
+pub(crate) fn reset_responses_stream_debug_state() {
+    UNHANDLED_RESPONSES_EVENT_LOG_COUNT.store(0, Ordering::Relaxed);
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -80,6 +88,7 @@ pub(crate) enum NormalizedStreamEvent {
         name: String,
         input_json: String,
     },
+    UpstreamError(String),
     StopReason(String),
 }
 
@@ -1007,6 +1016,18 @@ fn normalized_stream_events_from_responses_event(
 ) -> Option<Vec<NormalizedStreamEvent>> {
     let event_type = value.get("type")?.as_str()?;
     match event_type {
+        "response.output_text.done" => {
+            let text = value
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(vec![NormalizedStreamEvent::TextSnapshot(text)])
+            }
+        }
         "response.output_text.delta" => Some(vec![NormalizedStreamEvent::TextDelta(
             value
                 .get("delta")
@@ -1014,6 +1035,22 @@ fn normalized_stream_events_from_responses_event(
                 .unwrap_or_default()
                 .to_string(),
         )]),
+        "response.content_part.added" | "response.content_part.delta" => {
+            let text = responses_output_text_from_content_part(value)?;
+            if text.is_empty() {
+                None
+            } else {
+                Some(vec![NormalizedStreamEvent::TextDelta(text)])
+            }
+        }
+        "response.content_part.done" => {
+            let text = responses_output_text_from_content_part(value)?;
+            if text.is_empty() {
+                None
+            } else {
+                Some(vec![NormalizedStreamEvent::TextSnapshot(text)])
+            }
+        }
         "response.output_item.added" => {
             let item = value.get("item")?;
             if item.get("type")?.as_str()? != "function_call" {
@@ -1040,13 +1077,82 @@ fn normalized_stream_events_from_responses_event(
                     .to_string(),
             }])
         }
+        "response.function_call_arguments.done" => {
+            Some(vec![NormalizedStreamEvent::ToolInputDelta {
+                partial_json: value
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            }])
+        }
+        "response.failed" => Some(vec![NormalizedStreamEvent::UpstreamError(
+            responses_failure_message(value),
+        )]),
         "response.completed" => value
             .get("response")
             .and_then(|response| response.get("stop_reason"))
             .and_then(Value::as_str)
             .map(|reason| vec![NormalizedStreamEvent::StopReason(map_stop_reason(reason))]),
-        _ => None,
+        "error" => Some(vec![NormalizedStreamEvent::UpstreamError(
+            value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .or_else(|| value.get("message").and_then(Value::as_str))
+                .unwrap_or("upstream streaming error")
+                .to_string(),
+        )]),
+        _ => {
+            if event_type.starts_with("response.") {
+                let seen = UNHANDLED_RESPONSES_EVENT_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+                if seen < MAX_UNHANDLED_RESPONSES_EVENT_LOGS {
+                    tracing::info!(
+                        event_type,
+                        event_preview = %preview_text(&value.to_string(), 300),
+                        "unhandled responses stream event"
+                    );
+                } else if seen == MAX_UNHANDLED_RESPONSES_EVENT_LOGS {
+                    tracing::info!(
+                        max_logs = MAX_UNHANDLED_RESPONSES_EVENT_LOGS,
+                        "suppressing additional unhandled responses stream event logs"
+                    );
+                }
+            }
+            None
+        }
     }
+}
+
+fn responses_output_text_from_content_part(value: &Value) -> Option<String> {
+    let part = value.get("part")?;
+    if part.get("type").and_then(Value::as_str) != Some("output_text") {
+        return None;
+    }
+
+    Some(
+        part.get("text")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("delta").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+fn responses_failure_message(value: &Value) -> String {
+    value
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("status"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("upstream request failed")
+        .to_string()
 }
 
 fn normalized_stream_events_from_responses_output_item(

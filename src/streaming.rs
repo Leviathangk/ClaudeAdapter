@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::{
     config::ApiMode,
-    error::ProxyError,
+    error::{ProxyError, is_context_window_error_message, normalize_upstream_error_message},
     logging::{append_error_log, preview_text},
     normalized::{NormalizedStreamEvent, normalized_stream_events_from_openai},
     protocol::{AnthropicContentResponseBlock, AnthropicMessagesResponse, estimate_token_count},
@@ -259,6 +259,13 @@ pub(crate) fn anthropic_sse_stream(
                                                     }
                                                 }),
                                             )?;
+                                            tracing::info!(
+                                                index = new_index,
+                                                tool_name = %name,
+                                                call_id = %id,
+                                                input_preview = %preview_text(&input_json, 200),
+                                                "anthropic stream finalizing completed tool call"
+                                            );
                                             active_block = Some(StreamBlockState::ToolUse {
                                                 index: new_index,
                                                 id,
@@ -287,7 +294,13 @@ pub(crate) fn anthropic_sse_stream(
                                         *saw_input_delta = true;
                                     }
 
-                                    tracing::info!(index, "anthropic stream finalizing completed tool call");
+                                    if existing_tool.is_some() {
+                                        tracing::info!(
+                                            index,
+                                            input_preview = %preview_text(&input_json, 200),
+                                            "anthropic stream finalizing completed tool call"
+                                        );
+                                    }
                                     if let Some(previous) = active_block.take() {
                                         yield content_block_stop_event(previous.index())?;
                                     }
@@ -307,6 +320,24 @@ pub(crate) fn anthropic_sse_stream(
                                     )?;
                                     yield sse_event_bytes("message_stop", json!({"type": "message_stop"}))?;
                                     tracing::info!(output_preview = %preview_text(&output_text, 120), "anthropic stream completed");
+                                    return;
+                                }
+                                NormalizedStreamEvent::UpstreamError(message) => {
+                                    let normalized_message = normalize_upstream_error_message(&message);
+                                    tracing::warn!(message = %normalized_message, "anthropic upstream stream failed");
+                                    if let Some(previous) = active_block.take() {
+                                        yield content_block_stop_event(previous.index())?;
+                                    }
+                                    yield sse_event_bytes(
+                                        "error",
+                                        json!({
+                                            "type": "error",
+                                            "error": {
+                                                "type": "api_error",
+                                                "message": normalized_message
+                                            }
+                                        }),
+                                    )?;
                                     return;
                                 }
                                 NormalizedStreamEvent::StopReason(reason) => {
@@ -602,6 +633,9 @@ pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<St
                         output.push_str(&snapshot);
                     }
                 }
+                NormalizedStreamEvent::UpstreamError(message) => {
+                    return Err(classify_upstream_stream_error(&message));
+                }
                 _ => {}
             }
         }
@@ -622,6 +656,15 @@ pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<St
     }
 
     Ok(output)
+}
+
+fn classify_upstream_stream_error(message: &str) -> ProxyError {
+    let normalized = normalize_upstream_error_message(message);
+    if is_context_window_error_message(message) {
+        return ProxyError::bad_request(format!("upstream stream failed: {normalized}"));
+    }
+
+    ProxyError::bad_gateway(format!("upstream stream failed: {normalized}"))
 }
 
 fn io_error<E: std::fmt::Display>(error: E) -> std::io::Error {

@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     config::{ApiMode, ProviderConfig, ResponsesMetadataMode},
-    error::ProxyError,
+    error::{ProxyError, normalize_upstream_error_message},
     logging::preview_text,
     normalized::{
         anthropic_response_from_normalized, normalized_messages_from_anthropic,
@@ -698,8 +698,9 @@ pub(crate) fn anthropic_error_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<Response<Body>, ProxyError> {
-    let message = extract_upstream_error_message(content_type, body)
+    let raw_message = extract_upstream_error_message(content_type, body)
         .unwrap_or_else(|| format!("upstream request failed with status {status}"));
+    let message = normalize_upstream_error_message(&raw_message);
     let payload = json!({
         "type": "error",
         "error": {

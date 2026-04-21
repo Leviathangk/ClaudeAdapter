@@ -21,6 +21,7 @@ use crate::{
     },
     error::{ProxyError, error_response},
     logging::{append_error_log, preview_text},
+    normalized::reset_responses_stream_debug_state,
     protocol::{
         AnthropicMessagesRequest, anthropic_error_response, anthropic_text_response,
         anthropic_to_provider_request, extract_anthropic_message_preview, extract_message_preview,
@@ -148,6 +149,10 @@ async fn anthropic_messages_inner(
         message_preview = %message_preview,
         "incoming request"
     );
+
+    if matches!(provider.api_mode, crate::config::ApiMode::Responses) {
+        reset_responses_stream_debug_state();
+    }
 
     let upstream_payload = anthropic_to_provider_request(&payload, provider, &target_model)?;
     let upstream = send_upstream_request(&state, provider, upstream_payload).await?;

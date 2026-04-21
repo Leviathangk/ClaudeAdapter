@@ -44,6 +44,35 @@ impl ProxyError {
     }
 }
 
+pub(crate) fn is_context_window_error_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("context window")
+        || lower.contains("max context")
+        || lower.contains("maximum context")
+        || lower.contains("too many tokens")
+}
+
+pub(crate) fn normalize_upstream_error_message(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "upstream request failed".to_string();
+    }
+
+    if trimmed
+        .to_ascii_lowercase()
+        .contains("prompt is too long")
+    {
+        return trimmed.to_string();
+    }
+
+    if is_context_window_error_message(trimmed) {
+        return format!("Prompt is too long: {trimmed}");
+    }
+
+    trimmed.to_string()
+}
+
 pub(crate) fn error_response(error: ProxyError) -> Response<Body> {
     append_error_log(
         "proxy error",

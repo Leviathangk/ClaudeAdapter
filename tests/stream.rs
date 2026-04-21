@@ -263,3 +263,54 @@ async fn finalizes_tool_use_stream_without_waiting_for_upstream_completion() {
     assert!(text.contains("event: message_stop"));
     handle.abort();
 }
+
+#[tokio::test]
+async fn streams_context_window_failure_as_prompt_too_long_error_event() {
+    let upstream_app = Router::new().route(
+        "/responses",
+        post(|Json(_payload): Json<Value>| async move {
+            let stream = futures_util::stream::iter(vec![Ok::<Bytes, Infallible>(Bytes::from(
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_123\",\"status\":\"failed\",\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the context window of this model. Please adjust your input and try again.\"}}}\n\n",
+            ))]);
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.unwrap();
+    });
+
+    let app = build_router(test_config(format!("http://{address}"), ApiMode::Responses));
+    let response = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer incoming-secret")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("event: error"));
+    assert!(text.contains("Prompt is too long"));
+    assert!(text.contains("context window"));
+
+    handle.abort();
+}
