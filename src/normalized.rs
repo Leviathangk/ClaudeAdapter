@@ -1056,35 +1056,50 @@ fn normalized_stream_events_from_responses_event(
             if item.get("type")?.as_str()? != "function_call" {
                 return None;
             }
+            let call_id = responses_function_call_id(item).unwrap_or_default();
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arguments_raw = item.get("arguments");
+            tracing::info!(
+                call_id = %call_id,
+                name = %name,
+                arguments_shape = responses_value_shape(arguments_raw),
+                arguments_preview = %preview_text(&responses_json_like_text(arguments_raw), 180),
+                "responses stream function_call added"
+            );
             Some(vec![NormalizedStreamEvent::ToolUseStart {
-                id: responses_function_call_id(item).unwrap_or_default(),
-                name: item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                id: call_id,
+                name,
             }])
         }
         "response.output_item.done" => {
             normalized_stream_events_from_responses_output_item(value.get("item")?)
         }
         "response.function_call_arguments.delta" => {
+            let delta_text = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            tracing::info!(
+                delta_preview = %preview_text(&delta_text, 180),
+                "responses stream function_call arguments delta"
+            );
             Some(vec![NormalizedStreamEvent::ToolInputDelta {
-                partial_json: value
-                    .get("delta")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                partial_json: delta_text,
             }])
         }
         "response.function_call_arguments.done" => {
-            Some(vec![NormalizedStreamEvent::ToolInputDelta {
-                partial_json: value
-                    .get("arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            }])
+            let arguments_text = responses_json_like_text(value.get("arguments"));
+            tracing::info!(
+                arguments_shape = responses_value_shape(value.get("arguments")),
+                arguments_preview = %preview_text(&arguments_text, 180),
+                "responses stream function_call arguments done (ignored; output_item.done will finalize args)"
+            );
+            None
         }
         "response.failed" => Some(vec![NormalizedStreamEvent::UpstreamError(
             responses_failure_message(value),
@@ -1187,11 +1202,14 @@ fn normalized_stream_events_from_responses_output_item(
                 .unwrap_or_default()
                 .to_string();
             let id = responses_function_call_id(item).unwrap_or_default();
-            let input_json = item
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+            let input_json = responses_json_like_text(item.get("arguments"));
+            tracing::info!(
+                call_id = %id,
+                name = %name,
+                arguments_shape = responses_value_shape(item.get("arguments")),
+                arguments_preview = %preview_text(&input_json, 180),
+                "responses stream function_call done"
+            );
 
             Some(vec![NormalizedStreamEvent::ToolUseSnapshot {
                 id,
@@ -1208,4 +1226,24 @@ fn responses_function_call_id(item: &Value) -> Option<String> {
         .or_else(|| item.get("id"))
         .and_then(Value::as_str)
         .map(|id| id.to_string())
+}
+
+fn responses_value_shape(value: Option<&Value>) -> &'static str {
+    match value {
+        Some(Value::String(_)) => "string",
+        Some(Value::Object(_)) => "object",
+        Some(Value::Array(_)) => "array",
+        Some(Value::Number(_)) => "number",
+        Some(Value::Bool(_)) => "boolean",
+        Some(Value::Null) => "null",
+        None => "missing",
+    }
+}
+
+fn responses_json_like_text(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Null) | None => String::new(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+    }
 }

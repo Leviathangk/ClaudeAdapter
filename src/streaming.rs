@@ -268,8 +268,8 @@ pub(crate) fn anthropic_sse_stream(
                                             );
                                             active_block = Some(StreamBlockState::ToolUse {
                                                 index: new_index,
-                                                id,
-                                                name,
+                                                id: id.clone(),
+                                                name: name.clone(),
                                                 saw_input_delta: false,
                                             });
                                             (new_index, true)
@@ -297,6 +297,8 @@ pub(crate) fn anthropic_sse_stream(
                                     if existing_tool.is_some() {
                                         tracing::info!(
                                             index,
+                                            tool_name = %name,
+                                            call_id = %id,
                                             input_preview = %preview_text(&input_json, 200),
                                             "anthropic stream finalizing completed tool call"
                                         );

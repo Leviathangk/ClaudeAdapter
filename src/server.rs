@@ -422,6 +422,7 @@ async fn send_upstream_request(
         .get("tools")
         .and_then(Value::as_array)
         .map(|items| items.len());
+    let tools_preview = summarize_tools_for_log(&payload);
     let stream = payload.get("stream").and_then(Value::as_bool);
     tracing::info!(
         url = %url,
@@ -429,6 +430,7 @@ async fn send_upstream_request(
         stream = ?stream,
         input_count = ?input_count,
         tools_count = ?tools_count,
+        tools_preview = %tools_preview,
         payload_preview = %payload_preview,
         "sending upstream request"
     );
@@ -525,6 +527,50 @@ fn provider_url(provider: &ProviderConfig) -> Result<String, ProxyError> {
     };
 
     Ok(format!("{base}{path}"))
+}
+
+fn summarize_tools_for_log(payload: &Value) -> String {
+    let Some(tools) = payload.get("tools").and_then(Value::as_array) else {
+        return "none".to_string();
+    };
+
+    if tools.is_empty() {
+        return "empty".to_string();
+    }
+
+    let mut names = Vec::new();
+    for tool in tools.iter().take(8) {
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("<unnamed>");
+        let schema = tool
+            .get("parameters")
+            .or_else(|| tool.get("input_schema"))
+            .or_else(|| {
+                tool.get("function")
+                    .and_then(|function| function.get("parameters"))
+            });
+        let schema_keys = schema
+            .and_then(|value| value.get("properties"))
+            .and_then(Value::as_object)
+            .map(|props| props.len())
+            .unwrap_or(0);
+        names.push(format!("{name}({schema_keys} keys)"));
+    }
+
+    let suffix = if tools.len() > names.len() {
+        format!(" +{} more", tools.len() - names.len())
+    } else {
+        String::new()
+    };
+
+    format!("{}{}", names.join(", "), suffix)
 }
 
 fn resolve_secret(raw: &str) -> Result<String> {
