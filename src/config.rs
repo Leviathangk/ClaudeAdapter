@@ -37,6 +37,8 @@ pub struct ProviderConfig {
     pub model_default: String,
     #[serde(default)]
     pub model_map: HashMap<String, String>,
+    #[serde(default = "default_responses_metadata_mode")]
+    pub responses_metadata_mode: ResponsesMetadataMode,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -46,8 +48,20 @@ pub enum ApiMode {
     Responses,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsesMetadataMode {
+    #[serde(alias = "metadata")]
+    ClientMetadata,
+    Omit,
+}
+
 pub(crate) fn default_bind() -> String {
     "127.0.0.1:8787".to_string()
+}
+
+fn default_responses_metadata_mode() -> ResponsesMetadataMode {
+    ResponsesMetadataMode::ClientMetadata
 }
 
 pub fn load_config(path: &Path) -> Result<Config> {
@@ -239,4 +253,41 @@ pub(crate) fn mapped_model(provider: &ProviderConfig, requested_model: &str) -> 
 pub(crate) fn validate_bind(bind: &str) -> Result<SocketAddr> {
     bind.parse()
         .with_context(|| format!("invalid bind address: {bind}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ProviderConfig, ResponsesMetadataMode};
+
+    fn provider_yaml(extra: &str) -> String {
+        format!(
+            "\
+base_url: http://127.0.0.1:8787
+api_mode: responses
+api_key: provider-secret
+headers: {{}}
+model_default: gpt-5.4
+model_map: {{}}
+{extra}"
+        )
+    }
+
+    #[test]
+    fn responses_metadata_mode_defaults_to_client_metadata() {
+        let provider: ProviderConfig = serde_yaml::from_str(&provider_yaml("")).unwrap();
+        assert_eq!(
+            provider.responses_metadata_mode,
+            ResponsesMetadataMode::ClientMetadata
+        );
+    }
+
+    #[test]
+    fn legacy_metadata_mode_alias_maps_to_client_metadata() {
+        let provider: ProviderConfig =
+            serde_yaml::from_str(&provider_yaml("responses_metadata_mode: metadata\n")).unwrap();
+        assert_eq!(
+            provider.responses_metadata_mode,
+            ResponsesMetadataMode::ClientMetadata
+        );
+    }
 }

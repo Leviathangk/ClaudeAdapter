@@ -67,8 +67,19 @@ pub(crate) struct NormalizedResponse {
 #[derive(Debug, Clone)]
 pub(crate) enum NormalizedStreamEvent {
     TextDelta(String),
-    ToolUseStart { id: String, name: String },
-    ToolInputDelta { partial_json: String },
+    TextSnapshot(String),
+    ToolUseStart {
+        id: String,
+        name: String,
+    },
+    ToolInputDelta {
+        partial_json: String,
+    },
+    ToolUseSnapshot {
+        id: String,
+        name: String,
+        input_json: String,
+    },
     StopReason(String),
 }
 
@@ -264,13 +275,7 @@ pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessa
 
     for message in messages {
         match message.role {
-            NormalizedRole::SystemPrompt => {
-                if let Some(message_item) =
-                    responses_message_from_blocks("system", &message.blocks, false)
-                {
-                    items.push(message_item);
-                }
-            }
+            NormalizedRole::SystemPrompt => {}
             NormalizedRole::User => {
                 let mut pending_content = Vec::new();
 
@@ -322,7 +327,7 @@ pub(crate) fn normalized_messages_to_responses_input(messages: &[NormalizedMessa
                             }
                             items.push(json!({
                                 "type": "function_call",
-                                "id": id,
+                                "id": responses_function_call_item_id(id),
                                 "call_id": id,
                                 "name": name,
                                 "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string()),
@@ -505,23 +510,6 @@ fn chat_attachment_fallback_part(kind: &str, value: &Value) -> Option<Value> {
         .unwrap_or_default();
 
     chat_text_part(&format!("[{kind} attachment omitted{label}]"))
-}
-
-fn responses_message_from_blocks(
-    role: &str,
-    blocks: &[NormalizedBlock],
-    assistant_message: bool,
-) -> Option<Value> {
-    let content = blocks
-        .iter()
-        .filter_map(|block| responses_content_item_from_block(block, assistant_message))
-        .collect::<Vec<_>>();
-
-    if content.is_empty() {
-        None
-    } else {
-        Some(responses_message(role, content))
-    }
 }
 
 fn responses_message(role: &str, content: Vec<Value>) -> Value {
@@ -919,6 +907,21 @@ fn anthropic_tool_result_text(content: &Value) -> String {
     strip_system_reminders(&value_as_text(content).unwrap_or_else(|| content.to_string()))
 }
 
+fn responses_function_call_item_id(call_id: &str) -> String {
+    let sanitized = call_id
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+
+    if sanitized.is_empty() {
+        format!("fc_{}", simple_id())
+    } else if sanitized.starts_with("fc") {
+        sanitized
+    } else {
+        format!("fc_{sanitized}")
+    }
+}
+
 fn simple_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
@@ -1025,6 +1028,9 @@ fn normalized_stream_events_from_responses_event(
                     .to_string(),
             }])
         }
+        "response.output_item.done" => {
+            normalized_stream_events_from_responses_output_item(value.get("item")?)
+        }
         "response.function_call_arguments.delta" => {
             Some(vec![NormalizedStreamEvent::ToolInputDelta {
                 partial_json: value
@@ -1039,6 +1045,54 @@ fn normalized_stream_events_from_responses_event(
             .and_then(|response| response.get("stop_reason"))
             .and_then(Value::as_str)
             .map(|reason| vec![NormalizedStreamEvent::StopReason(map_stop_reason(reason))]),
+        _ => None,
+    }
+}
+
+fn normalized_stream_events_from_responses_output_item(
+    item: &Value,
+) -> Option<Vec<NormalizedStreamEvent>> {
+    match item.get("type")?.as_str()? {
+        "message" => {
+            let mut snapshot = String::new();
+            for part in item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(part_text) = part.get("text").and_then(Value::as_str)
+                    && !part_text.is_empty()
+                {
+                    snapshot.push_str(part_text);
+                }
+            }
+
+            if snapshot.is_empty() {
+                None
+            } else {
+                Some(vec![NormalizedStreamEvent::TextSnapshot(snapshot)])
+            }
+        }
+        "function_call" => {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let id = responses_function_call_id(item).unwrap_or_default();
+            let input_json = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+
+            Some(vec![NormalizedStreamEvent::ToolUseSnapshot {
+                id,
+                name,
+                input_json,
+            }])
+        }
         _ => None,
     }
 }

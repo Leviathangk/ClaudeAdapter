@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    config::{ApiMode, ProviderConfig},
+    config::{ApiMode, ProviderConfig, ResponsesMetadataMode},
     error::ProxyError,
     logging::preview_text,
     normalized::{
@@ -80,6 +80,10 @@ pub(crate) struct AnthropicTool {
     #[serde(default)]
     pub(crate) description: String,
     pub(crate) input_schema: Value,
+    #[serde(default)]
+    pub(crate) strict: Option<bool>,
+    #[serde(default)]
+    pub(crate) defer_loading: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,7 +321,7 @@ pub(crate) fn anthropic_to_provider_request(
 ) -> Result<Value, ProxyError> {
     match provider.api_mode {
         ApiMode::ChatCompletions => Ok(anthropic_to_chat_completions(payload, target_model)),
-        ApiMode::Responses => anthropic_to_responses(payload, target_model),
+        ApiMode::Responses => anthropic_to_responses(payload, provider, target_model),
     }
 }
 
@@ -348,6 +352,7 @@ fn anthropic_to_chat_completions(payload: &AnthropicMessagesRequest, target_mode
 
 fn anthropic_to_responses(
     payload: &AnthropicMessagesRequest,
+    provider: &ProviderConfig,
     target_model: &str,
 ) -> Result<Value, ProxyError> {
     let input =
@@ -361,6 +366,9 @@ fn anthropic_to_responses(
     let mut body = json!({
         "model": target_model,
         "input": input,
+        "parallel_tool_calls": false,
+        "store": false,
+        "include": [],
     });
     if let Some(max_tokens) = payload.max_tokens {
         body["max_output_tokens"] = json!(max_tokens);
@@ -371,8 +379,12 @@ fn anthropic_to_responses(
     if let Some(top_p) = payload.top_p {
         body["top_p"] = json!(top_p);
     }
+    body["stream"] = json!(payload.stream);
+    if let Some(system) = payload.system_text() {
+        body["instructions"] = json!(system);
+    }
     apply_tools_to_responses_body(&mut body, payload);
-    apply_request_options_to_responses_body(&mut body, payload);
+    apply_request_options_to_responses_body(&mut body, payload, provider);
     Ok(body)
 }
 
@@ -383,13 +395,17 @@ fn apply_tools_to_chat_completions_body(body: &mut Value, payload: &AnthropicMes
                 .tools
                 .iter()
                 .map(|tool| {
+                    let mut function = json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    });
+                    if tool.strict == Some(true) {
+                        function["strict"] = json!(true);
+                    }
                     json!({
                         "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.input_schema,
-                        }
+                        "function": function,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -408,12 +424,17 @@ fn apply_tools_to_responses_body(body: &mut Value, payload: &AnthropicMessagesRe
                 .tools
                 .iter()
                 .map(|tool| {
-                    json!({
+                    let mut mapped = json!({
                         "type": "function",
                         "name": tool.name,
                         "description": tool.description,
+                        "strict": tool.strict.unwrap_or(false),
                         "parameters": tool.input_schema,
-                    })
+                    });
+                    if tool.defer_loading == Some(true) {
+                        mapped["defer_loading"] = json!(true);
+                    }
+                    mapped
                 })
                 .collect::<Vec<_>>()
         );
@@ -421,6 +442,8 @@ fn apply_tools_to_responses_body(body: &mut Value, payload: &AnthropicMessagesRe
 
     if let Some(tool_choice) = &payload.tool_choice {
         body["tool_choice"] = anthropic_tool_choice_to_responses(tool_choice);
+    } else if !payload.tools.is_empty() {
+        body["tool_choice"] = json!("auto");
     }
 }
 
@@ -450,9 +473,18 @@ fn apply_request_options_to_chat_completions_body(
     }
 }
 
-fn apply_request_options_to_responses_body(body: &mut Value, payload: &AnthropicMessagesRequest) {
+fn apply_request_options_to_responses_body(
+    body: &mut Value,
+    payload: &AnthropicMessagesRequest,
+    provider: &ProviderConfig,
+) {
     if let Some(metadata) = payload.metadata_object() {
-        body["metadata"] = Value::Object(metadata.clone());
+        if provider.responses_metadata_mode == ResponsesMetadataMode::ClientMetadata {
+            let client_metadata = anthropic_metadata_to_client_metadata(metadata);
+            if !client_metadata.is_empty() {
+                body["client_metadata"] = Value::Object(client_metadata);
+            }
+        }
     }
 
     if let Some(effort) = payload
@@ -471,6 +503,19 @@ fn apply_request_options_to_responses_body(body: &mut Value, payload: &Anthropic
     {
         body["text"] = json!({ "format": format });
     }
+}
+
+fn anthropic_metadata_to_client_metadata(metadata: &Map<String, Value>) -> Map<String, Value> {
+    metadata
+        .iter()
+        .map(|(key, value)| {
+            let string_value = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            (key.clone(), Value::String(string_value))
+        })
+        .collect()
 }
 
 fn openai_reasoning_effort(effort: &str) -> Option<&'static str> {
@@ -517,15 +562,13 @@ fn anthropic_output_format_to_responses(format: &Value) -> Option<Value> {
             let schema = format.get("schema")?.clone();
             let mut mapped = json!({
                 "type": "json_schema",
-                "name": output_format_name(format),
+                "name": responses_output_format_name(format),
                 "schema": schema,
+                "strict": format.get("strict").and_then(Value::as_bool).unwrap_or(true),
             });
 
             if let Some(description) = format.get("description").and_then(Value::as_str) {
                 mapped["description"] = json!(description);
-            }
-            if let Some(strict) = format.get("strict").and_then(Value::as_bool) {
-                mapped["strict"] = json!(strict);
             }
 
             Some(mapped)
@@ -540,6 +583,14 @@ fn output_format_name(format: &Value) -> &str {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .unwrap_or("claude_code_output")
+}
+
+fn responses_output_format_name(format: &Value) -> &str {
+    format
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("codex_output_schema")
 }
 
 fn anthropic_tool_choice_to_chat_completions(tool_choice: &AnthropicToolChoice) -> Value {

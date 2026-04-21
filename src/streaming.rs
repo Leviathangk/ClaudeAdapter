@@ -41,7 +41,9 @@ pub(crate) fn anthropic_sse_stream(
 
         let mut parser = SseParser::default();
         let mut output_text = String::new();
+        let mut saw_text_delta = false;
         let mut stop_reason = "end_turn".to_string();
+        let mut next_block_index = 0usize;
         let mut active_block: Option<StreamBlockState> = None;
         let mut upstream_stream = upstream.bytes_stream();
         while let Some(chunk) = upstream_stream.try_next().await.map_err(|e| {
@@ -60,7 +62,7 @@ pub(crate) fn anthropic_sse_stream(
                                         Some(StreamBlockState::ToolUse { id: current_id, name: current_name, .. }) => {
                                             current_id != &id || current_name != &name
                                         }
-                                        Some(StreamBlockState::Text) => true,
+                                        Some(StreamBlockState::Text { .. }) => true,
                                         None => true,
                                     };
 
@@ -68,11 +70,13 @@ pub(crate) fn anthropic_sse_stream(
                                         if let Some(previous) = active_block.take() {
                                             yield content_block_stop_event(previous.index())?;
                                         }
+                                        let index = next_block_index;
+                                        next_block_index += 1;
                                         yield sse_event_bytes(
                                             "content_block_start",
                                             json!({
                                                 "type": "content_block_start",
-                                                "index": 0,
+                                                "index": index,
                                                 "content_block": {
                                                     "type": "tool_use",
                                                     "id": id,
@@ -81,60 +85,256 @@ pub(crate) fn anthropic_sse_stream(
                                                 }
                                             }),
                                         )?;
-                                        active_block = Some(StreamBlockState::ToolUse { index: 0, id, name });
+                                        active_block = Some(StreamBlockState::ToolUse {
+                                            index,
+                                            id,
+                                            name,
+                                            saw_input_delta: false,
+                                        });
                                     }
                                 }
                                 NormalizedStreamEvent::ToolInputDelta { partial_json } => {
                                     if !partial_json.is_empty() {
+                                        let index = match active_block.as_ref() {
+                                            Some(StreamBlockState::ToolUse { index, .. }) => Some(*index),
+                                            _ => None,
+                                        };
+
+                                        let Some(index) = index else {
+                                            continue;
+                                        };
+
                                         yield sse_event_bytes(
                                             "content_block_delta",
                                             json!({
                                                 "type": "content_block_delta",
-                                                "index": 0,
+                                                "index": index,
                                                 "delta": {
                                                     "type": "input_json_delta",
                                                     "partial_json": partial_json
                                                 }
                                             }),
                                         )?;
+                                        if let Some(StreamBlockState::ToolUse { saw_input_delta, .. }) =
+                                            active_block.as_mut()
+                                        {
+                                            *saw_input_delta = true;
+                                        }
                                     }
                                 }
                                 NormalizedStreamEvent::TextDelta(text) => {
                                     if !text.is_empty() {
-                                        let start_text_block = !matches!(active_block, Some(StreamBlockState::Text));
-                                        if start_text_block {
-                                            if let Some(previous) = active_block.take() {
-                                                yield content_block_stop_event(previous.index())?;
+                                        saw_text_delta = true;
+                                        let index = match active_block.as_ref() {
+                                            Some(StreamBlockState::Text { index, .. }) => *index,
+                                            _ => {
+                                                if let Some(previous) = active_block.take() {
+                                                    yield content_block_stop_event(previous.index())?;
+                                                }
+                                                let index = next_block_index;
+                                                next_block_index += 1;
+                                                yield sse_event_bytes(
+                                                    "content_block_start",
+                                                    json!({
+                                                        "type": "content_block_start",
+                                                        "index": index,
+                                                        "content_block": {
+                                                            "type": "text",
+                                                            "text": ""
+                                                        }
+                                                    }),
+                                                )?;
+                                                active_block = Some(StreamBlockState::Text {
+                                                    index,
+                                                    saw_delta: false,
+                                                });
+                                                index
                                             }
-                                            yield sse_event_bytes(
-                                                "content_block_start",
-                                                json!({
-                                                    "type": "content_block_start",
-                                                    "index": 0,
-                                                    "content_block": {
-                                                        "type": "text",
-                                                        "text": ""
-                                                    }
-                                                }),
-                                            )?;
-                                            active_block = Some(StreamBlockState::Text);
-                                        }
+                                        };
                                         output_text.push_str(&text);
                                         yield sse_event_bytes(
                                             "content_block_delta",
                                             json!({
                                                 "type": "content_block_delta",
-                                                "index": 0,
+                                                "index": index,
                                                 "delta": {
                                                     "type": "text_delta",
                                                     "text": text
                                                 }
                                             }),
                                         )?;
+                                        if let Some(StreamBlockState::Text { saw_delta, .. }) =
+                                            active_block.as_mut()
+                                        {
+                                            *saw_delta = true;
+                                        }
                                     }
+                                }
+                                NormalizedStreamEvent::TextSnapshot(text) => {
+                                    if !text.is_empty() && !saw_text_delta {
+                                        let existing_text_block = match active_block.as_ref() {
+                                            Some(StreamBlockState::Text { index, saw_delta }) => {
+                                                Some((*index, *saw_delta))
+                                            }
+                                            _ => None,
+                                        };
+
+                                        let index = if let Some((_, true)) = existing_text_block {
+                                            continue;
+                                        } else if let Some((index, false)) = existing_text_block {
+                                            index
+                                        } else {
+                                            if let Some(previous) = active_block.take() {
+                                                yield content_block_stop_event(previous.index())?;
+                                            }
+                                            let index = next_block_index;
+                                            next_block_index += 1;
+                                            yield sse_event_bytes(
+                                                "content_block_start",
+                                                json!({
+                                                    "type": "content_block_start",
+                                                    "index": index,
+                                                    "content_block": {
+                                                        "type": "text",
+                                                        "text": ""
+                                                    }
+                                                }),
+                                            )?;
+                                            active_block = Some(StreamBlockState::Text {
+                                                index,
+                                                saw_delta: false,
+                                            });
+                                            index
+                                        };
+                                        output_text.push_str(&text);
+                                        yield sse_event_bytes(
+                                            "content_block_delta",
+                                            json!({
+                                                "type": "content_block_delta",
+                                                "index": index,
+                                                "delta": {
+                                                    "type": "text_delta",
+                                                    "text": text
+                                                }
+                                            }),
+                                        )?;
+                                        if let Some(StreamBlockState::Text { saw_delta, .. }) =
+                                            active_block.as_mut()
+                                        {
+                                            *saw_delta = true;
+                                        }
+                                    }
+                                }
+                                NormalizedStreamEvent::ToolUseSnapshot { id, name, input_json } => {
+                                    let existing_tool = match active_block.as_ref() {
+                                        Some(StreamBlockState::ToolUse {
+                                            index,
+                                            id: current_id,
+                                            name: current_name,
+                                            saw_input_delta,
+                                        }) if current_id == &id && current_name == &name => {
+                                            Some((*index, *saw_input_delta))
+                                        }
+                                        _ => None,
+                                    };
+
+                                    let (index, should_emit_input) =
+                                        if let Some((index, saw_input_delta)) = existing_tool {
+                                            (index, !saw_input_delta)
+                                        } else {
+                                            if let Some(previous) = active_block.take() {
+                                                yield content_block_stop_event(previous.index())?;
+                                            }
+                                            let new_index = next_block_index;
+                                            yield sse_event_bytes(
+                                                "content_block_start",
+                                                json!({
+                                                    "type": "content_block_start",
+                                                    "index": new_index,
+                                                    "content_block": {
+                                                        "type": "tool_use",
+                                                        "id": id,
+                                                        "name": name,
+                                                        "input": {}
+                                                    }
+                                                }),
+                                            )?;
+                                            active_block = Some(StreamBlockState::ToolUse {
+                                                index: new_index,
+                                                id,
+                                                name,
+                                                saw_input_delta: false,
+                                            });
+                                            (new_index, true)
+                                        };
+
+                                    if should_emit_input && !input_json.is_empty() {
+                                        yield sse_event_bytes(
+                                            "content_block_delta",
+                                            json!({
+                                                "type": "content_block_delta",
+                                                "index": index,
+                                                "delta": {
+                                                    "type": "input_json_delta",
+                                                    "partial_json": input_json
+                                                }
+                                            }),
+                                        )?;
+                                    }
+                                    if let Some(StreamBlockState::ToolUse { saw_input_delta, .. }) =
+                                        active_block.as_mut()
+                                    {
+                                        *saw_input_delta = true;
+                                    }
+
+                                    tracing::info!(index, "anthropic stream finalizing completed tool call");
+                                    if let Some(previous) = active_block.take() {
+                                        yield content_block_stop_event(previous.index())?;
+                                    }
+                                    stop_reason = "tool_use".to_string();
+                                    yield sse_event_bytes(
+                                        "message_delta",
+                                        json!({
+                                            "type": "message_delta",
+                                            "delta": {
+                                                "stop_reason": stop_reason,
+                                                "stop_sequence": Value::Null
+                                            },
+                                            "usage": {
+                                                "output_tokens": estimate_token_count(&output_text)
+                                            }
+                                        }),
+                                    )?;
+                                    yield sse_event_bytes("message_stop", json!({"type": "message_stop"}))?;
+                                    tracing::info!(output_preview = %preview_text(&output_text, 120), "anthropic stream completed");
+                                    return;
                                 }
                                 NormalizedStreamEvent::StopReason(reason) => {
                                     stop_reason = reason;
+                                    if stop_reason == "tool_use"
+                                        && matches!(active_block, Some(StreamBlockState::ToolUse { .. }))
+                                    {
+                                        tracing::info!("anthropic stream finalizing on upstream tool_use stop_reason");
+                                        if let Some(previous) = active_block.take() {
+                                            yield content_block_stop_event(previous.index())?;
+                                        }
+                                        yield sse_event_bytes(
+                                            "message_delta",
+                                            json!({
+                                                "type": "message_delta",
+                                                "delta": {
+                                                    "stop_reason": stop_reason,
+                                                    "stop_sequence": Value::Null
+                                                },
+                                                "usage": {
+                                                    "output_tokens": estimate_token_count(&output_text)
+                                                }
+                                            }),
+                                        )?;
+                                        yield sse_event_bytes("message_stop", json!({"type": "message_stop"}))?;
+                                        tracing::info!(output_preview = %preview_text(&output_text, 120), "anthropic stream completed");
+                                        return;
+                                    }
                                 }
                             }
                         }
@@ -385,14 +585,24 @@ pub(crate) fn collect_text_from_sse(api_mode: ApiMode, body: &[u8]) -> Result<St
     let mut parser = SseParser::default();
     let events = parser.push(&text);
     let mut output = String::new();
+    let mut saw_text_delta = false;
 
     for event in events {
         if event == "[DONE]" {
             continue;
         }
         for normalized_event in normalized_stream_events_from_openai(api_mode, &event) {
-            if let NormalizedStreamEvent::TextDelta(delta) = normalized_event {
-                output.push_str(&delta);
+            match normalized_event {
+                NormalizedStreamEvent::TextDelta(delta) => {
+                    saw_text_delta = true;
+                    output.push_str(&delta);
+                }
+                NormalizedStreamEvent::TextSnapshot(snapshot) => {
+                    if !saw_text_delta {
+                        output.push_str(&snapshot);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -419,18 +629,22 @@ fn io_error<E: std::fmt::Display>(error: E) -> std::io::Error {
 }
 
 enum StreamBlockState {
-    Text,
+    Text {
+        index: usize,
+        saw_delta: bool,
+    },
     ToolUse {
         index: usize,
         id: String,
         name: String,
+        saw_input_delta: bool,
     },
 }
 
 impl StreamBlockState {
     fn index(&self) -> usize {
         match self {
-            StreamBlockState::Text => 0,
+            StreamBlockState::Text { index, .. } => *index,
             StreamBlockState::ToolUse { index, .. } => *index,
         }
     }

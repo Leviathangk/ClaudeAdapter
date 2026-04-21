@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use claude_adapter::{ApiMode, Config, ProviderConfig};
+use claude_adapter::{ApiMode, Config, ProviderConfig, ResponsesMetadataMode};
 
 pub fn test_config(base_url: String, api_mode: ApiMode) -> Config {
     Config {
@@ -19,6 +19,7 @@ pub fn test_config(base_url: String, api_mode: ApiMode) -> Config {
                     ("claude-sonnet-4.6".to_string(), "gpt-4.1-mini".to_string()),
                     ("claude-opus-4-6".to_string(), "o3".to_string()),
                 ]),
+                responses_metadata_mode: ResponsesMetadataMode::ClientMetadata,
             },
         )]),
     }

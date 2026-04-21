@@ -64,13 +64,18 @@ async fn forwards_anthropic_tools_to_responses_in_responses_format() {
                 "type": "function",
                 "name": "Read",
                 "description": "Read a file",
+                "strict": false,
                 "parameters": {
                     "type": "object",
                     "properties": {"path": {"type": "string"}},
                     "required": ["path"]
                 }
             }],
-            "tool_choice": {"type": "function", "name": "Read"}
+            "parallel_tool_calls": false,
+            "store": false,
+            "include": [],
+            "tool_choice": {"type": "function", "name": "Read"},
+            "stream": false
         }));
         then.status(200)
             .header("content-type", "application/json")
@@ -87,6 +92,65 @@ async fn forwards_anthropic_tools_to_responses_in_responses_format() {
                 "messages": [{"role": "user", "content": "hello"}],
                 "tools": [{"name": "Read", "description": "Read a file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}],
                 "tool_choice": {"type": "tool", "name": "Read"}
+            }).to_string())).unwrap())
+        .await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    upstream.assert();
+}
+
+#[tokio::test]
+async fn defaults_responses_tool_choice_to_auto_and_preserves_codex_tool_fields() {
+    let server = MockServer::start();
+    let upstream = server.mock(|when, then| {
+        when.method(POST).path("/responses").json_body(json!({
+            "model": "o3",
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "hello"
+                }]
+            }],
+            "tools": [{
+                "type": "function",
+                "name": "Read",
+                "description": "Read a file",
+                "strict": true,
+                "defer_loading": true,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}},
+                    "required": ["path"]
+                }
+            }],
+            "parallel_tool_calls": false,
+            "store": false,
+            "include": [],
+            "tool_choice": "auto",
+            "stream": false
+        }));
+        then.status(200)
+            .header("content-type", "application/json")
+            .json_body(json!({"output": [{"content": [{"text": "done"}]}]}));
+    });
+
+    let app = build_router(test_config(server.base_url(), ApiMode::Responses));
+    let response = app
+        .oneshot(Request::post("/v1/messages")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer incoming-secret")
+            .body(Body::from(json!({
+                "model": "claude-opus-4-6",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "name": "Read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+                    "strict": true,
+                    "defer_loading": true
+                }]
             }).to_string())).unwrap())
         .await.unwrap();
 
@@ -153,32 +217,103 @@ async fn forwards_claude_code_multiturn_context_to_responses_as_structured_items
     let requests = captured.lock().unwrap();
     let input = requests[0]["input"].as_array().unwrap();
 
-    assert_eq!(input[0]["role"], "system");
     assert_eq!(
-        input[0]["content"][0]["text"],
+        requests[0]["instructions"],
         "x-anthropic-billing-header: cc_version=2.1.107\nYou are Claude Code."
     );
 
-    assert_eq!(input[1]["role"], "user");
-    assert_eq!(input[1]["content"][0]["type"], "input_text");
-    assert_eq!(input[1]["content"][0]["text"], "read src/main.rs");
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[0]["content"][0]["text"], "read src/main.rs");
 
-    assert_eq!(input[2]["role"], "assistant");
-    assert_eq!(input[2]["content"][0]["type"], "output_text");
-    assert_eq!(input[2]["content"][0]["text"], "I will inspect the file.");
+    assert_eq!(input[1]["role"], "assistant");
+    assert_eq!(input[1]["content"][0]["type"], "output_text");
+    assert_eq!(input[1]["content"][0]["text"], "I will inspect the file.");
 
-    assert_eq!(input[3]["type"], "function_call");
+    assert_eq!(input[2]["type"], "function_call");
+    assert_eq!(input[2]["id"], "fc_call_123");
+    assert_eq!(input[2]["call_id"], "call_123");
+    assert_eq!(input[2]["name"], "Read");
+    assert_eq!(input[2]["arguments"], "{\"path\":\"src/main.rs\"}");
+
+    assert_eq!(input[3]["type"], "function_call_output");
     assert_eq!(input[3]["call_id"], "call_123");
-    assert_eq!(input[3]["name"], "Read");
-    assert_eq!(input[3]["arguments"], "{\"path\":\"src/main.rs\"}");
+    assert_eq!(input[3]["output"][0]["type"], "input_text");
+    assert_eq!(input[3]["output"][0]["text"], "fn main() {}");
 
-    assert_eq!(input[4]["type"], "function_call_output");
-    assert_eq!(input[4]["call_id"], "call_123");
-    assert_eq!(input[4]["output"][0]["type"], "input_text");
-    assert_eq!(input[4]["output"][0]["text"], "fn main() {}");
+    assert_eq!(input[4]["role"], "user");
+    assert_eq!(input[4]["content"][0]["text"], "continue");
 
-    assert_eq!(input[5]["role"], "user");
-    assert_eq!(input[5]["content"][0]["text"], "continue");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn rewrites_claude_tool_use_ids_to_codex_function_call_item_ids() {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_for_route = Arc::clone(&captured);
+
+    let upstream_app = Router::new().route(
+        "/responses",
+        post(move |Json(payload): Json<Value>| {
+            let captured_for_route = Arc::clone(&captured_for_route);
+            async move {
+                captured_for_route.lock().unwrap().push(payload);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"output": [{"content": [{"text": "done"}]}]}).to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.unwrap();
+    });
+
+    let app = build_router(test_config(format!("http://{address}"), ApiMode::Responses));
+    let response = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer incoming-secret")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "messages": [
+                            {"role": "assistant", "content": [{
+                                "type": "tool_use",
+                                "id": "chatcmpl-tool-8001ddac645a3bc5",
+                                "name": "Read",
+                                "input": {"path": "src/main.rs"}
+                            }]},
+                            {"role": "user", "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": "chatcmpl-tool-8001ddac645a3bc5",
+                                "content": "fn main() {}"
+                            }]}
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = captured.lock().unwrap();
+    let input = requests[0]["input"].as_array().unwrap();
+
+    assert_eq!(input[0]["type"], "function_call");
+    assert_eq!(input[0]["id"], "fc_chatcmpl_tool_8001ddac645a3bc5");
+    assert_eq!(input[0]["call_id"], "chatcmpl-tool-8001ddac645a3bc5");
+
+    assert_eq!(input[1]["type"], "function_call_output");
+    assert_eq!(input[1]["call_id"], "chatcmpl-tool-8001ddac645a3bc5");
 
     handle.abort();
 }

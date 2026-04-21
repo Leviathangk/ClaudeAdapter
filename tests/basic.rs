@@ -384,10 +384,144 @@ async fn maps_claude_code_output_config_to_responses_request() {
 
     assert_eq!(response.status(), StatusCode::OK);
     let requests = captured.lock().unwrap();
-    assert_eq!(requests[0]["metadata"]["user_id"], "session_1");
+    assert_eq!(requests[0]["client_metadata"]["user_id"], "session_1");
+    assert_eq!(requests[0]["stream"], false);
+    assert_eq!(requests[0]["parallel_tool_calls"], false);
+    assert_eq!(requests[0]["store"], false);
+    assert_eq!(requests[0]["include"], json!([]));
     assert_eq!(requests[0]["reasoning"]["effort"], "xhigh");
     assert_eq!(requests[0]["text"]["format"]["type"], "json_schema");
-    assert_eq!(requests[0]["text"]["format"]["name"], "claude_code_output");
+    assert_eq!(requests[0]["text"]["format"]["name"], "codex_output_schema");
+    assert_eq!(requests[0]["text"]["format"]["strict"], true);
     assert_eq!(requests[0]["text"]["format"]["schema"]["required"][0], "ok");
+    assert!(requests[0].get("metadata").is_none());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn maps_claude_code_metadata_to_responses_client_metadata_for_codex_provider() {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_for_route = Arc::clone(&captured);
+
+    let upstream_app = Router::new().route(
+        "/responses",
+        post(move |Json(payload): Json<Value>| {
+            let captured_for_route = Arc::clone(&captured_for_route);
+            async move {
+                captured_for_route.lock().unwrap().push(payload);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"output": [{"content": [{"text": "done"}]}]}).to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.unwrap();
+    });
+
+    let app = build_router(test_config(format!("http://{address}"), ApiMode::Responses));
+    let response = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer incoming-secret")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "metadata": {
+                            "user_id": "session_1",
+                            "flags": ["a", "b"],
+                            "tracking": {"origin": "claude-code"},
+                            "enabled": true
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests[0]["client_metadata"]["user_id"], "session_1");
+    assert_eq!(requests[0]["client_metadata"]["flags"], "[\"a\",\"b\"]");
+    assert_eq!(
+        requests[0]["client_metadata"]["tracking"],
+        "{\"origin\":\"claude-code\"}"
+    );
+    assert_eq!(requests[0]["client_metadata"]["enabled"], "true");
+    assert!(requests[0].get("metadata").is_none());
+    handle.abort();
+}
+
+#[tokio::test]
+async fn forwards_anthropic_stream_flag_to_responses_upstream_request() {
+    let captured = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let captured_for_route = Arc::clone(&captured);
+
+    let upstream_app = Router::new().route(
+        "/responses",
+        post(move |Json(payload): Json<Value>| {
+            let captured_for_route = Arc::clone(&captured_for_route);
+            async move {
+                captured_for_route.lock().unwrap().push(payload);
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"output": [{"content": [{"text": "done"}]}]}).to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, upstream_app).await.unwrap();
+    });
+
+    let app = build_router(test_config(format!("http://{address}"), ApiMode::Responses));
+    let response = app
+        .oneshot(
+            Request::post("/v1/messages")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer incoming-secret")
+                .body(Body::from(
+                    json!({
+                        "model": "claude-opus-4-6",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hello"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .unwrap(),
+        "text/event-stream"
+    );
+    let requests = captured.lock().unwrap();
+    assert_eq!(requests[0]["stream"], true);
+    assert_eq!(requests[0]["parallel_tool_calls"], false);
+    assert_eq!(requests[0]["store"], false);
+    assert_eq!(requests[0]["include"], json!([]));
     handle.abort();
 }

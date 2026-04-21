@@ -1,6 +1,7 @@
 use anyhow::Result;
 use claude_adapter::{
-    RunOptions, append_error_log, install_panic_logger, load_config, load_env_file, run,
+    RunOptions, append_error_log, init_tracing, install_panic_logger, load_config, load_env_file,
+    run,
 };
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -34,7 +35,7 @@ async fn real_main() -> Result<()> {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    init_tracing(env_filter);
 
     let config = load_config(&options.config_path)?;
     run(

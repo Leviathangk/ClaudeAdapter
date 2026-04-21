@@ -172,6 +172,18 @@ async fn anthropic_messages_inner(
     tracing::info!(status = %status, content_type = %content_type, body_preview = %body_preview, "anthropic upstream response");
 
     if !status.is_success() {
+        tracing::warn!(
+            status = %status,
+            content_type = %content_type,
+            body_preview = %body_preview,
+            "anthropic upstream returned error response"
+        );
+        append_error_log(
+            "anthropic upstream error response",
+            &format!(
+                "status: {status}\ncontent_type: {content_type}\nbody_preview: {body_preview}"
+            ),
+        );
         return anthropic_error_response(status, &content_type, &body);
     }
 
@@ -219,6 +231,19 @@ async fn stream_anthropic_response(
             tracing::error!(error = %e, "failed to read anthropic error upstream body");
             ProxyError::bad_gateway(format!("failed to read upstream body: {e}"))
         })?;
+        let body_preview = preview_text(&String::from_utf8_lossy(&body), 400);
+        tracing::warn!(
+            status = %status,
+            content_type = %content_type,
+            body_preview = %body_preview,
+            "anthropic upstream stream returned error response"
+        );
+        append_error_log(
+            "anthropic upstream stream error response",
+            &format!(
+                "status: {status}\ncontent_type: {content_type}\nbody_preview: {body_preview}"
+            ),
+        );
         return anthropic_error_response(status, &content_type, &body);
     }
 
@@ -383,7 +408,25 @@ async fn send_upstream_request(
     payload: Value,
 ) -> Result<reqwest::Response, ProxyError> {
     let url = provider_url(provider)?;
-    tracing::info!(url = %url, api_mode = ?provider.api_mode, "sending upstream request");
+    let payload_preview = preview_text(&payload.to_string(), 800);
+    let input_count = payload
+        .get("input")
+        .and_then(Value::as_array)
+        .map(|items| items.len());
+    let tools_count = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|items| items.len());
+    let stream = payload.get("stream").and_then(Value::as_bool);
+    tracing::info!(
+        url = %url,
+        api_mode = ?provider.api_mode,
+        stream = ?stream,
+        input_count = ?input_count,
+        tools_count = ?tools_count,
+        payload_preview = %payload_preview,
+        "sending upstream request"
+    );
     let mut request = state.client.post(&url).json(&payload);
 
     let mut outbound_headers = HeaderMap::new();
